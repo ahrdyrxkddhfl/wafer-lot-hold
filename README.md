@@ -177,6 +177,22 @@ Lot 단위 Test의 Lot은 어떤 웨이퍼도 학습에 쓰이지 않았으므�
 - 판정 유형 분포: none 39,122 / Edge-Loc 3,701 / Edge-Ring 2,465 / Center 2,391 / Loc 2,196 / Random 474 /
   Scratch 457 / Donut 202 / Near-full 79.
 
+### 정지 규칙 후보 (검증용 Lot)
+
+정지 규칙의 기준값(정지 대상 유형, 판정 확률 하한, Lot당 최소 장수)은 시험용 Lot이 아니라 **검증용 Lot**으로 고른다.
+시험용 Lot으로 고르면 시험 결과에 맞춰 고른 셈이 되기 때문이다. 검증용 Lot 2,368개의 원본 웨이퍼 51,747장을 같은 모델로 판정했다
+([data/lot_valid_predictions_exp12_lotsplit.csv](data/lot_valid_predictions_exp12_lotsplit.csv), 정답은
+[evaluation/lot_valid_labels.csv](evaluation/lot_valid_labels.csv)).
+
+```bash
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.stage4 predict --split valid
+../SKALA_CNN-Optimization/.venv/bin/python -m analysis.stop_rule_candidates
+```
+
+후보별 정지율·괜히 멈춘 Lot·놓친 Lot은 [evaluation/stop_rule_candidates_valid.csv](evaluation/stop_rule_candidates_valid.csv)에 있다
+(후보 값은 [config/stop_rule_candidates.yaml](config/stop_rule_candidates.yaml)). 라벨 있는 웨이퍼가 없는 Lot 660개는 정답을 알 수 없어
+괜히 멈춤·놓침 계산에서 뺐다. 기준값은 아직 정하지 않았다.
+
 ## 한계 (현재까지)
 
 - 공정 순서, 설비 목록·상태는 합성값이다.
@@ -188,6 +204,8 @@ Lot 단위 Test의 Lot은 어떤 웨이퍼도 학습에 쓰이지 않았으므�
 - 학습용 축소 데이터는 불량 25,519장 전부와 none 또는 라벨 없음 5,000장으로 만들어 불량이 대부분이다.
 - 0단계 판정 파일(12번 모델)은 웨이퍼 단위 분할 모델의 결과이며, MES 시연에는 4단계의 Lot 단위 분할 모델을 쓴다.
 - 4단계 비교(웨이퍼 단위 vs Lot 단위)는 시드 하나로 한 것이다.
+- 시험용 Lot은 축소 데이터에 들어간 Lot에서 뽑았고, 축소 데이터는 불량 웨이퍼를 전부 넣었으므로 불량 Lot 비율이 높다
+  (라벨 있는 불량 웨이퍼가 1장 이상인 Lot이 2,362개 중 1,607개, 68.0%).
 - MES 전체가 아니라 일부 기능이다.
 
 ## 데이터와 모델 출처
