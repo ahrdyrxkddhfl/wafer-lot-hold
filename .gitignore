@@ -1,0 +1,13 @@
+# 개인 작업 지시서 (공개 저장소 제외)
+CLAUDE.md
+
+# 비밀값
+.env
+
+# 파이썬
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+.DS_Store

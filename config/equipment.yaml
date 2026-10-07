@@ -1,0 +1,46 @@
+# 검사 장비 역할(equipment/) 설정.
+# 웨이퍼 저장소 경로는 여기 쓰지 않는다. 기본값은 이 저장소 옆의 ../SKALA_CNN-Optimization이고,
+# 위치가 다르면 환경변수 WAFER_REPO로 덮어쓴다.
+
+wafer_repo:
+  # 웨이퍼 저장소 안의 상대경로. 저장소 구조가 바뀌면 여기만 고친다.
+  checkpoint: ckpt/exp12_best.pt
+  lswmd: data/LSWMD.pkl
+  split_npz: data/cache/split.npz
+
+model:
+  # 체크포인트 파일의 기대 SHA-256. 파일이 바뀌면 판정이 다른 모델 것이 되므로 다르면 멈춘다.
+  checkpoint_sha256: 438a047340520249016f0054f994528493508e9888d112c7a0b97bdd03704faf
+  # ImprovedCNN 생성 인자. 12번 실험(02-exp.ipynb 셀 16)과 같아야 한다.
+  # 다른 값을 넣어도 load_state_dict는 성공하지만 판정이 틀어진다(dropout/activation은 가중치 모양에 영향 없음).
+  dropout: 0.3          # 판정(eval) 시에는 꺼지지만 학습 설정과 맞춰 둔다
+  use_bn: true          # false면 BatchNorm 가중치가 남아 load_state_dict가 실패한다
+  activation: leakyrelu # 12번 학습에 쓴 활성함수
+  # 확인용으로 일부러 잘못 넣는 활성함수. 오류 없이 불러와지지만 점수가 달라지는 것을 보인다.
+  wrong_activation: relu
+
+data:
+  # 01-prep.ipynb 셀 2~3의 값. 바꾸면 기존 split.npz와 달라져 0단계 비교가 실패한다.
+  none_sample_n: 5000   # none 또는 라벨 없음 웨이퍼에서 뽑는 장수. 크면 정상 쪽 비중이 커진다
+  seed: 42              # sample·train_test_split의 random_state
+  test_size: 0.2        # 전체 중 Test 비율
+  valid_size: 0.25      # Test를 뺀 나머지 중 Valid 비율(0.25 × 0.8 = 전체의 20%)
+  image_size: 64        # 웨이퍼맵 축소 크기(가로=세로). 모델 입력 크기와 같아야 한다
+
+inference:
+  batch_size: 64        # 한 번에 판정하는 장수. 결과에는 영향 없고 메모리·속도만 바뀐다
+  # 산출물을 만드는 장치. cpu는 다른 컴퓨터에서도 같은 결과가 나온다.
+  device: cpu
+  # 비교용으로 한 번 더 판정할 장치. 원래 점수는 MPS에서 나왔다. 쓸 수 없으면 건너뛴다.
+  compare_device: mps
+
+verify:
+  # 12번 모델의 Test Macro-F1(웨이퍼 저장소 README). 0단계 재현의 기준값
+  expected_test_macro_f1: 0.8805
+  f1_decimals: 4        # 몇째 자리까지 같아야 통과인지. 크면 기준이 엄격해진다
+
+output:
+  # 이 저장소 기준 상대경로. 둘 다 커밋한다.
+  predictions: data/test_predictions_exp12.csv
+  # 정답 라벨. MES 코드는 이 파일을 읽지 않는다.
+  labels: evaluation/test_labels.csv
