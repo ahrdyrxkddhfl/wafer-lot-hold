@@ -668,6 +668,23 @@ def test_i8_same_batch_resent_counts_duplicates_and_keeps_hold(conn, route, eqs,
     assert count(conn, "SELECT count(*) FROM hold") == 1
 
 
+def test_i8_resend_after_lot_finished_counts_duplicates(conn, route, eqs, labels, rule):
+    """같은 파일을 다시 보낼 때, 이미 다음 공정으로 넘어가 끝난 Lot도 오류가 아니라 중복이어야 한다."""
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    track_out(conn, wo_id)
+    for step in route[route.index(service.INSPECT_STEP) + 1:]:
+        track_in(conn, f"LOT_A-{step}", "LOT_A", step, eqs[step][0])
+        track_out(conn, f"LOT_A-{step}")
+    assert lot_row(conn, "LOT_A")[0] == "FINISHED"
+
+    r = send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    assert (r.inserted, r.duplicates, r.hold) == (0, 2, None)
+    with pytest.raises(RuleViolation) as e:  # 새 판정이 섞이면 기간 밖이라 거절
+        send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, model=MODEL_B)
+    assert e.value.rule == "RESULT_NOT_ACCEPTED"
+
+
 def test_i8_results_of_different_model_hash_are_recorded_separately(conn, route, eqs, labels, rule):
     lot_at_inspect(conn, "LOT_A", route, eqs)
     send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, model=MODEL_A)

@@ -628,7 +628,8 @@ def receive_inspection_results(conn: psycopg.Connection, lot_id: str, work_order
 
     배치 안의 판정이 하나라도 잘못되면 배치 전체를 거절한다. 같은 (웨이퍼, 모델 해시, 차수)의 판정이
     이미 있으면 내용(판정 유형·확률)이 같을 때만 중복으로 세고, 다르면 배치 전체를 거절한다(I8).
-    판정은 "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에, 현재 차수(lot.inspect_round)로만 받는다.
+    새 판정은 "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에, 현재 차수(lot.inspect_round)로만 받는다.
+    모두 같은 내용의 재전송인 배치는 기간이 지났어도 중복으로 돌려준다(같은 파일을 다시 보내도 결과가 같게).
 
     Args:
         conn: autocommit 연결.
@@ -657,11 +658,6 @@ def receive_inspection_results(conn: psycopg.Connection, lot_id: str, work_order
             raise RuleViolation("NOT_FOUND", f"작업 지시 없음: {work_order_id}")
         if (wo["lot_id"], wo["step_code"]) != (lot_id, INSPECT_STEP):
             raise RuleViolation("RESULT_NOT_ACCEPTED", f"{work_order_id}는 {lot_id}의 {INSPECT_STEP} 작업 지시가 아님")
-        if not _in_inspect_window(cur, lot):
-            raise RuleViolation("RESULT_NOT_ACCEPTED",
-                                f"{lot_id}는 판정을 받는 기간이 아님({lot['current_step_code']} {lot['status']})")
-        if inspect_round != lot["inspect_round"]:
-            raise RuleViolation("ROUND_MISMATCH", f"{lot_id}의 현재 차수는 {lot['inspect_round']} (요청 {inspect_round})")
 
         wafer_ids = [r.wafer_id for r in results]
         cur.execute("SELECT wafer_id FROM wafer WHERE lot_id = %s AND wafer_id = ANY(%s)", (lot_id, wafer_ids))
@@ -680,6 +676,19 @@ def receive_inspection_results(conn: psycopg.Connection, lot_id: str, work_order
                 new.append(r)
             elif (old["pred_label"], old["probabilities"]) != (r.pred_label, r.probabilities):
                 raise RuleViolation("I8", f"{r.wafer_id}의 {inspect_round}차 판정이 다른 내용으로 이미 있음")
+        if not new:
+            # 모두 같은 내용의 재전송이면 기록할 것이 없으므로, 받는 기간이 지났어도(예: 이미 FINISHED) 중복으로 돌려준다.
+            # 규칙도 새로 적용하지 않고, 그 차수에 규칙 Hold가 있으면 그것을 알려 준다.
+            cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND inspect_round = %s "
+                        "AND trigger_result_id IS NOT NULL", (lot_id, inspect_round))
+            row = cur.fetchone()
+            return ReceiveResult(len(results), 0, len(results),
+                                 None if row is None else HoldResult(row["hold_id"], created=False))
+        if not _in_inspect_window(cur, lot):
+            raise RuleViolation("RESULT_NOT_ACCEPTED",
+                                f"{lot_id}는 판정을 받는 기간이 아님({lot['current_step_code']} {lot['status']})")
+        if inspect_round != lot["inspect_round"]:
+            raise RuleViolation("ROUND_MISMATCH", f"{lot_id}의 현재 차수는 {lot['inspect_round']} (요청 {inspect_round})")
         for r in new:
             cur.execute("INSERT INTO inspection_result "
                         "(wafer_id, work_order_id, inspect_round, model_sha256, pred_label, probabilities) "
