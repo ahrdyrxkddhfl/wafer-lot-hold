@@ -1,0 +1,35 @@
+# MES 테스트를 실제 PostgreSQL(서비스 컨테이너)에 대해 돌린다.
+# equipment/(torch 필요)는 웨이퍼 저장소 환경에서만 돌므로 여기서 테스트하지 않는다.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      # CI에서만 쓰고 버리는 DB의 비밀번호라 비밀값이 아니다.
+      POSTGRES_PASSWORD: ci-only-password
+    services:
+      postgres:
+        image: postgres:17.11  # docker-compose.yml과 같은 버전
+        env:
+          POSTGRES_USER: mes
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: wafer_mes_test
+        ports:
+          - 5434:5432  # config/mes.yaml의 db.port와 같게
+        options: >-
+          --health-cmd "pg_isready -U mes -d wafer_mes_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: pytest -v
