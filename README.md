@@ -12,7 +12,7 @@ MES 전체가 아니라 MES의 일부 기능(Lot 이력, 공정 순서, 정지·
 |---|---|---|
 | 0 | 데이터 준비와 검사 모델 재현 확인 | 완료 |
 | 1 | Lot·공정 순서·설비·이력 DB와 상태 규칙 | 완료 |
-| 4 | 검사 모델 Lot 단위 재평가, MES에 올릴 판정 데이터 생성 | 예정 |
+| 4 | 검사 모델 Lot 단위 재평가, MES에 올릴 판정 데이터 생성 | 완료 |
 | 2 | 판정 결과 수신 API와 자동 정지 | 예정 |
 | 3 | 생산 현황 보고(HTML), AI 판정 평가 | 예정 |
 
@@ -124,6 +124,59 @@ python3.11 -m venv .venv
 테스트는 개발용 DB(`wafer_mes`)가 아니라 테스트 전용 DB에서 돌고, 매 테스트 전에 모든 테이블을 비운다.
 GitHub Actions도 같은 PostgreSQL 버전의 서비스 컨테이너로 같은 테스트를 돌린다.
 
+## 4단계: 검사 모델 Lot 단위 재평가
+
+12번 모델은 웨이퍼 단위 무작위 분할로 학습해서, 같은 Lot의 다른 웨이퍼를 학습한 채 시험을 봤을 수 있다.
+같은 30,519장을 Lot 단위로 나눠(같은 Lot이 학습·검증·시험에 걸치지 않게) 12번과 같은 설정으로 다시 학습해 비교했다.
+
+```bash
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.stage4 plan      # 분할 확인, 1에폭 시간
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.stage4 train     # MPS 학습 → artifacts/
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.stage4 evaluate  # 비교 표
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.stage4 predict   # 시험용 Lot 전체 판정
+```
+
+- **분할**: `StratifiedGroupKFold`(groups=lotName, 클래스 층화, seed 42). 축소 데이터 Lot 11,823개를
+  train 7,093 / valid 2,368 / test 2,362개(웨이퍼 18,311 / 6,104 / 6,104장)로 나눴고 분할 사이 Lot 교집합은 0이다.
+  가장 적은 클래스는 Test의 Near-full 30장이다. 12번 Test와 겹치는 웨이퍼는 1,224장(20.1%)이다.
+- **학습**: 12번과 같은 설정([config/equipment.yaml](config/equipment.yaml) `train`), MPS, 6.2분(에폭당 6.0초).
+  최고 Valid Macro-F1 0.9022(52에폭), 62에폭에서 조기 종료. 에폭별 기록은
+  [evaluation/stage4_train_history.csv](evaluation/stage4_train_history.csv). 체크포인트 SHA-256 `1e02579e…32a7bb`(저장소에 없음).
+
+### 비교 (Test Macro-F1, CPU 판정)
+
+| | 데이터 | 장수 | 12번 모델 | Lot 단위 모델 |
+|---|---|---|---|---|
+| (가) | 12번의 웨이퍼 단위 Test | 6,104 | **0.8805** | — |
+| (나) | Lot 단위 Test | 6,104 | — | **0.8887** |
+| (다) | 두 Test가 겹치는 웨이퍼 | 1,224 | 0.8821 | 0.8758 |
+| (다-1) | 그중 12번 train에 같은 Lot 웨이퍼가 있었던 것 | 857 | 0.8606 | 0.8529 |
+| (다-2) | 그중 없었던 것 | 367 | 0.8535 | 0.8465 |
+
+클래스별 F1과 장수는 [evaluation/stage4_comparison.csv](evaluation/stage4_comparison.csv)에 있다.
+"12번 train"은 train만 센 것이다(train+valid로 세면 1,224장 중 891장). valid는 가중치 학습에 쓰이지 않고
+멈출 에폭 선택에만 쓰였기 때문이다.
+
+- 같은 Lot을 미리 본 효과가 있다면 12번 모델은 (다-1)에서만 새 모델보다 높아야 한다. 결과는 (다-1)에서 +0.0077,
+  (다-2)에서 +0.0070으로 두 쪽 차이가 비슷해, **이 데이터에서는 같은 Lot을 미리 본 효과가 보이지 않았다.**
+  Lot 단위 모델도 자기 Test에서 0.8887로 12번(0.8805)보다 낮지 않았다.
+- 한계: 시드 하나로 한 비교라 결론이 아니라 방향이다. (다-2)는 367장으로 작고 클래스 구성이 (다-1)과 크게 다르다
+  (Edge-Ring 8장 대 402장, none 160장 대 40장). 그래서 (다-1)과 (다-2)의 점수끼리는 비교하지 않고, 같은 칸에서 두 모델만 비교했다.
+  (다)의 Near-full은 4장, Donut은 14장이라 이 두 클래스의 F1은 한두 장에 크게 흔들린다.
+  MPS 학습은 같은 seed로 다시 돌려도 결과가 조금 다를 수 있다.
+
+### MES에 올릴 판정 데이터
+
+Lot 단위 Test의 Lot은 어떤 웨이퍼도 학습에 쓰이지 않았으므로, 원본에서 그 Lot에 속한 웨이퍼 **전부**를 새 모델로 판정했다
+(축소 데이터에 없던 라벨 없음·none 웨이퍼 포함, CPU 판정).
+
+- [data/lot_test_predictions_exp12_lotsplit.csv](data/lot_test_predictions_exp12_lotsplit.csv): Lot 2,362개, 웨이퍼 51,087장, 9.34 MB.
+  Lot당 웨이퍼 1~25장(중앙값 25, 25장인 Lot 1,615개), waferIndex 1~25. 열은 0단계 판정 파일과 같다.
+- [evaluation/lot_test_labels.csv](evaluation/lot_test_labels.csv): 정답(평가 전용, MES 코드는 읽지 않음).
+  라벨 있음 23,192장(불량 5,104, none 18,088), 라벨 없음 27,895장.
+- 판정 유형 분포: none 39,122 / Edge-Loc 3,701 / Edge-Ring 2,465 / Center 2,391 / Loc 2,196 / Random 474 /
+  Scratch 457 / Donut 202 / Near-full 79.
+
 ## 한계 (현재까지)
 
 - 공정 순서, 설비 목록·상태는 합성값이다.
@@ -134,6 +187,7 @@ GitHub Actions도 같은 PostgreSQL 버전의 서비스 컨테이너로 같은 �
   라벨 없음을 정상으로 치지 않고 따로 센다.
 - 학습용 축소 데이터는 불량 25,519장 전부와 none 또는 라벨 없음 5,000장으로 만들어 불량이 대부분이다.
 - 0단계 판정 파일(12번 모델)은 웨이퍼 단위 분할 모델의 결과이며, MES 시연에는 4단계의 Lot 단위 분할 모델을 쓴다.
+- 4단계 비교(웨이퍼 단위 vs Lot 단위)는 시드 하나로 한 것이다.
 - MES 전체가 아니라 일부 기능이다.
 
 ## 데이터와 모델 출처
