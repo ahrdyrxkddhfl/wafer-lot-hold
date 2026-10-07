@@ -42,6 +42,14 @@ class WorkOrderResult:
 
 
 @dataclass(frozen=True)
+class LotResult:
+    """Lot 생성 결과. 같은 Lot·같은 웨이퍼 구성으로 다시 요청하면 already_processed=True."""
+    lot_id: str
+    n_wafers: int
+    already_processed: bool
+
+
+@dataclass(frozen=True)
 class DispositionResult:
     """처분 결과. 같은 내용의 처분 요청이 다시 오면 already_processed=True로 기존 처분을 돌려준다."""
     disposition_id: int
@@ -179,15 +187,31 @@ def _add_history(cur: psycopg.Cursor, lot_id: str, event: str, step_code: str | 
                 (lot_id, event, step_code, equipment_id, work_order_id, hold_id))
 
 
-def create_lot(conn: psycopg.Connection, lot_id: str, wafers: list[tuple[str, int]]) -> None:
+def create_lot(conn: psycopg.Connection, lot_id: str, wafers: list[tuple[str, int]]) -> LotResult:
     """Lot과 웨이퍼를 만들고 첫 공정 대기 상태로 둔다.
+
+    같은 Lot이 이미 있으면 웨이퍼 구성이 같을 때는 기존 결과를 돌려주고(재전송), 다르면 거절한다(작업 지시 I3와 같은 방식).
 
     Args:
         conn: autocommit 연결.
         lot_id: Lot ID.
         wafers: (웨이퍼 ID, 웨이퍼 번호) 목록.
+
+    Returns:
+        Lot 생성 결과.
+
+    Raises:
+        RuleViolation: 웨이퍼가 없거나(INVALID) 같은 Lot이 다른 웨이퍼 구성으로 이미 있을 때(LOT_EXISTS).
     """
+    if not wafers:
+        raise RuleViolation("INVALID", f"{lot_id}에 웨이퍼가 없음")
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT 1 FROM lot WHERE lot_id = %s", (lot_id,))
+        if cur.fetchone() is not None:
+            cur.execute("SELECT wafer_id, wafer_index FROM wafer WHERE lot_id = %s", (lot_id,))
+            if {(r["wafer_id"], r["wafer_index"]) for r in cur.fetchall()} != set(wafers):
+                raise RuleViolation("LOT_EXISTS", f"{lot_id}가 다른 웨이퍼 구성으로 이미 있음")
+            return LotResult(lot_id, len(wafers), already_processed=True)
         cur.execute("SELECT step_code FROM route_step ORDER BY seq LIMIT 1")
         first = cur.fetchone()
         if first is None:
@@ -198,6 +222,25 @@ def create_lot(conn: psycopg.Connection, lot_id: str, wafers: list[tuple[str, in
                         [(wafer_id, lot_id, idx) for wafer_id, idx in wafers])
         _add_history(cur, lot_id, "CREATED", step_code=first["step_code"])
     logger.info("Lot 생성 %s (웨이퍼 %d장)", lot_id, len(wafers))
+    return LotResult(lot_id, len(wafers), already_processed=False)
+
+
+def get_equipment_layout(conn: psycopg.Connection) -> dict:
+    """공정 순서와 공정별 설비·상태, 검사 공정 이름을 돌려준다(장비 쪽이 MES 설정 파일을 읽지 않게).
+
+    Returns:
+        {"inspect_step": ..., "steps": [{"step_code", "seq", "equipment": [{"equipment_id", "status"}]}]}
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT r.step_code, r.seq, e.equipment_id, e.status FROM route_step r "
+                    "LEFT JOIN equipment e ON e.step_code = r.step_code ORDER BY r.seq, e.equipment_id")
+        steps: dict[str, dict] = {}
+        for row in cur.fetchall():
+            step = steps.setdefault(row["step_code"], {"step_code": row["step_code"], "seq": row["seq"],
+                                                       "equipment": []})
+            if row["equipment_id"] is not None:
+                step["equipment"].append({"equipment_id": row["equipment_id"], "status": row["status"]})
+    return {"inspect_step": INSPECT_STEP, "steps": list(steps.values())}
 
 
 def _started_lot_on(cur: psycopg.Cursor, equipment_id: str) -> str | None:
