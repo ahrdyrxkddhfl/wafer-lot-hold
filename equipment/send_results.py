@@ -9,7 +9,11 @@ DB에 직접 쓰지 않고, MES 설정 파일도 읽지 않는다. 공정 순서
 
 웨이퍼 저장소의 .venv(requests, pandas 포함)로 이 저장소 루트에서 실행한다. MES API가 떠 있어야 한다.
     ../SKALA_CNN-Optimization/.venv/bin/python -m equipment.send_results
+    ../SKALA_CNN-Optimization/.venv/bin/python -m equipment.send_results --lot lot10084 --round 2
+뒤의 형태는 재검사(RETEST)로 차수가 오른 Lot 하나의 판정만 지정한 차수로 다시 보낸다(Lot 생성·투입은 하지 않음).
 """
+import argparse
+import json
 import logging
 import sys
 import time
@@ -98,9 +102,27 @@ def send_lot(mes: MesClient, lot_id: str, lot: pd.DataFrame, labels: list[str], 
     counts["finished_lots"] += 1
 
 
+def send_round(mes: MesClient, df: pd.DataFrame, labels: list[str], inspect_step: str, lot_id: str,
+               inspect_round: int) -> None:
+    """Lot 하나의 판정을 지정한 차수로 다시 보낸다(재검사 뒤 새 차수 판정)."""
+    lot = df[df["lot_name"] == lot_id]
+    if lot.empty:
+        raise ValueError(f"판정 파일에 없는 Lot: {lot_id}")
+    result = mes.call("POST", f"/lots/{lot_id}/inspection-results",
+                      batch_body(lot, labels, f"{lot_id}-{inspect_step}", inspect_round)).json()
+    logger.info("%s %d차 판정 전송: %s", lot_id, inspect_round, json.dumps(result, ensure_ascii=False))
+
+
 def main() -> int:
-    """판정 파일 전체를 보내고 건수를 출력한다."""
+    """판정 파일 전체(또는 --lot으로 지정한 Lot 하나의 한 차수)를 보내고 건수를 출력한다."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="검사 판정을 MES API로 보낸다")
+    parser.add_argument("--lot", help="이 Lot 하나의 판정만 보낸다(--round와 함께)")
+    parser.add_argument("--round", type=int, help="--lot의 판정을 보낼 검사 차수(재검사 뒤 2 이상)")
+    args = parser.parse_args()
+    if (args.lot is None) != (args.round is None):
+        parser.error("--lot과 --round는 함께 줘야 한다")
+
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     api = cfg["mes_api"]
@@ -109,6 +131,9 @@ def main() -> int:
     layout = mes.call("GET", "/equipment").json()
     steps = sorted(layout["steps"], key=lambda s: s["seq"])
     df, labels = load_lots(PROJECT_ROOT / cfg["output"]["lot_predictions"])
+    if args.lot is not None:
+        send_round(mes, df, labels, layout["inspect_step"], args.lot, args.round)
+        return 0
     lots = list(df.groupby("lot_name", sort=True))
     logger.info("공정 %s, 검사 공정 %s, Lot %d개, 판정 %d건", [s["step_code"] for s in steps],
                 layout["inspect_step"], len(lots), len(df))
