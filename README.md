@@ -13,7 +13,7 @@ MES 전체가 아니라 MES의 일부 기능(Lot 이력, 공정 순서, 정지·
 | 0 | 데이터 준비와 검사 모델 재현 확인 | 완료 |
 | 1 | Lot·공정 순서·설비·이력 DB와 상태 규칙 | 완료 |
 | 4 | 검사 모델 Lot 단위 재평가, MES에 올릴 판정 데이터 생성 | 완료 |
-| 2 | 판정 결과 수신 API와 자동 정지 | 예정 |
+| 2 | 판정 결과 수신 API와 자동 정지 | 완료 |
 | 3 | 생산 현황 보고(HTML), AI 판정 평가 | 예정 |
 
 ## 0단계: 데이터 준비와 모델 재현 확인
@@ -76,14 +76,18 @@ ORM 없이 SQL을 직접 써서 잠금과 트랜잭션 범위가 코드에 그�
   완료(track_out)로 끝나며, ID는 지시하는 쪽이 정한다.
 - **Lot 상태**는 `WAITING`(현재 공정 대기) → `IN_PROCESS` → 다음 공정 `WAITING` … → `FINISHED`. `SCRAPPED`는 끝 상태다.
   Hold 여부는 Lot 상태에 넣지 않고 열린 Hold 행으로 판단한다.
-- **Hold**는 무엇이 열었는지 남긴다. 판정 규칙이면 그 판정 결과(`trigger_result_id`), 설비 고장이면 그 상태 변경
-  이력(`trigger_equipment_history_id`, 규칙 이름 `EQUIPMENT_DOWN`), 사람이면 연 사람(`opened_by`, 규칙 이름 `MANUAL`)
-  중 정확히 하나가 있다(`CHECK num_nonnulls(...) = 1`).
+- **Hold**는 무엇이 열었는지 남긴다. 판정 규칙이면 그 판정 결과(`trigger_result_id`)와 그때의 기준값(`rule_params`),
+  설비 고장이면 그 상태 변경 이력(`trigger_equipment_history_id`, 규칙 이름 `EQUIPMENT_DOWN`), 사람이면 연 사람
+  (`opened_by`, 규칙 이름 `MANUAL`) 중 정확히 하나가 있다(`CHECK num_nonnulls(...) = 1`).
+  열린 Hold는 **종류(규칙 이름)별로** Lot당 하나다. 종류가 다르면 함께 열린다.
+- **Hold는 다음 공정 투입만 막는다(I4).** 완료(설비에서 내리기)는 막지 않는다. Hold된 Lot이 설비를 계속 차지하면
+  사람이 처분할 때까지 그 설비에 다른 Lot을 넣을 수 없기 때문이다.
 - **설비 상태 변경**: 계획 정비(MAINTENANCE)는 처리 중인 Lot이 있으면 거절한다(I12). 고장(DOWN)은 받고, 그 설비에서
-  처리 중인 Lot에 같은 트랜잭션으로 `EQUIPMENT_DOWN` Hold를 연다. 그 Lot은 Hold 때문에 완료가 막힌다(I4).
+  처리 중인 Lot에 같은 트랜잭션으로 `EQUIPMENT_DOWN` Hold를 연다.
 - **처분**은 해제(RELEASE), 재검사(RETEST: 검사 차수 `inspect_round` +1), 폐기(SCRAP)이며 결정자와 사유가 필요하다.
-  재검사는 Lot이 INSPECT에서 처리 중일 때만 받는다. 이미 처분된 Hold에 같은 내용의 처분이 다시 오면 기존 처분을
-  돌려주고, 다른 내용이면 거절한다. AI 판정(`inspection_result`)과 사람의 결정(`hold_disposition`)은 다른 테이블에 기록한다.
+  처분은 Hold 하나만 닫으므로, 다른 종류의 Hold가 열려 있으면 Lot은 계속 멈춰 있다(폐기는 그 Lot의 열린 Hold를 모두 닫는다).
+  재검사는 INSPECT를 시작한 뒤부터 다음 공정 투입 전까지만 받는다. 이미 처분된 Hold에 같은 내용의 처분이 다시 오면
+  기존 처분을 돌려주고, 다른 내용이면 거절한다. AI 판정(`inspection_result`)과 사람의 결정(`hold_disposition`)은 다른 테이블에 기록한다.
 - 시각은 모두 DB가 찍는다(`timestamptz DEFAULT now()`).
 
 ### 막는 상태
@@ -93,19 +97,21 @@ ORM 없이 SQL을 직접 써서 잠금과 트랜잭션 범위가 코드에 그�
 | I1 | 공정 순서 건너뛰기 | 요청 공정이 Lot의 현재 공정보다 뒤면 거절 | 공정 순서는 `route_step.seq` 기준 |
 | I2 | 끝난 공정 다시 처리 | 그 공정의 작업 지시 이력이 있으면 거절 | `UNIQUE (lot_id, step_code)` |
 | I3 | 같은 작업 지시 두 번 처리 | 같은 ID·같은 내용이면 "이미 처리됨"으로 같은 결과 반환, 다른 내용이면 거절 | `work_order_id` 기본키 |
-| I4 | Hold된 Lot 진행 | 열린 Hold가 있으면 투입·완료 거절 | — |
+| I4 | Hold된 Lot 진행 | 열린 Hold가 하나라도 있으면 투입 거절(완료는 허용) | — |
 | I5 | 사유·결정자 없는 처분 | 빈 값·공백 거절 | `NOT NULL` + `CHECK (btrim(...) <> '')` |
 | I6 | 정지·정비 중인 설비에 투입 | 설비가 `AVAILABLE`이 아니면 거절 | 상태 값 `CHECK` |
 | I7 | 두 설비가 같은 Lot을 동시에 처리 | Lot 행 `SELECT ... FOR NO KEY UPDATE` 후 처리 중이면 거절 | 부분 유일 인덱스 `(lot_id) WHERE status='STARTED'` |
-| I8 | 같은 판정 결과를 다시 보냄 | (2단계) | `UNIQUE (wafer_id, model_sha256, inspect_round)` |
-| I9 | 한 Lot에 열린 Hold가 두 개 | 열린 Hold가 있으면 새로 만들지 않고 그 Hold 반환 | 부분 유일 인덱스 `(lot_id) WHERE closed_at IS NULL` |
+| I8 | 같은 판정 결과를 다시 보냄 | 같은 (웨이퍼, 모델 해시, 차수)에 같은 내용이면 중복으로 세고, 다른 내용이면 배치 전체 거절 | `UNIQUE (wafer_id, model_sha256, inspect_round)` |
+| I9 | 한 Lot에 같은 종류의 열린 Hold가 두 개 | 같은 종류의 열린 Hold가 있으면 새로 만들지 않고 그 Hold 반환 | 부분 유일 인덱스 `(lot_id, rule_name) WHERE closed_at IS NULL` |
 | I10 | 폐기된 Lot 진행 | `SCRAPPED`면 투입·완료·Hold 거절 | — |
 | I11 | 한 설비가 두 Lot을 동시에 처리 | 설비 행 `SELECT ... FOR NO KEY UPDATE` 후 처리 중인 Lot이 있으면 거절 | 부분 유일 인덱스 `(equipment_id) WHERE status='STARTED'` |
 | I12 | 처리 중인 설비를 계획 정비로 변경 | 그 설비에 처리 중인 Lot이 있으면 거절 (고장은 받고 그 Lot에 Hold) | — |
+| I13 | 검사 결과 없이 검사 공정 통과 | 검사 다음 공정에 투입하려면 모든 웨이퍼에 현재 차수 판정이 있어야 함 | — |
 
 잠금이 정상 경로이고 제약은 마지막 방어선이다. 잠금이 제대로 걸리면 제약 위반은 일어날 수 없으므로,
 제약 위반은 규칙 오류로 바꾸지 않고 그대로 실패시킨다. 규칙마다 테스트가 [tests/test_rules.py](tests/test_rules.py)에 있고,
-I7·I11은 연결 두 개를 배리어로 같은 순간에 출발시켜 하나만 성공하는지 확인한다.
+I7·I11은 연결 두 개를 배리어로 같은 순간에 출발시켜 하나만 성공하는지 확인한다. 설비 고장과 투입·완료·판정 수신이
+겹치는 경우는 출발 지연으로 두 순서를 각각 강제해 결과와 교착 여부를 확인한다.
 
 - I7 잠금을 뺀 실험에서는 같은 공정 중복을 막는 I2 제약(`UNIQUE (lot_id, step_code)`)이 먼저 막았다.
 - 외래키 확인이 참조 행에 거는 잠금 때문에 생긴 교착을 동시성 테스트로 찾아 행 잠금 방식을 바꿨다
@@ -123,6 +129,55 @@ python3.11 -m venv .venv
 
 테스트는 개발용 DB(`wafer_mes`)가 아니라 테스트 전용 DB에서 돌고, 매 테스트 전에 모든 테이블을 비운다.
 GitHub Actions도 같은 PostgreSQL 버전의 서비스 컨테이너로 같은 테스트를 돌린다.
+
+## 2단계: 장비 연동과 자동 정지
+
+검사 장비는 DB에 직접 쓰지 않고 MES API([mes/api.py](mes/api.py))로만 기록한다. **장비는 공정 규칙을 모르므로,
+모든 기록이 MES 규칙을 지나가는 입구를 하나로 두기 위해서다.** 실제 장비 통신 규격(SECS/GEM) 대신 HTTP를 썼다.
+
+```
+검사 장비 역할 스크립트 ──HTTP──▶ MES API (FastAPI, 동기) ──▶ mes/service.py (규칙·잠금) ──▶ PostgreSQL
+(equipment/send_results.py)        입력 형식 검사(pydantic)        한 요청 = 한 트랜잭션
+```
+
+| 메서드 | 경로 | 하는 일 |
+|---|---|---|
+| GET | `/equipment` | 공정 순서, 공정별 설비·상태, 검사 공정 이름 |
+| POST | `/lots` | Lot·웨이퍼 생성 (같은 구성 재요청은 기존 결과, 다른 구성은 409) |
+| POST | `/work-orders` | 작업 지시에 따른 투입 |
+| POST | `/work-orders/{id}/complete` | 완료 |
+| POST | `/lots/{lot_id}/inspection-results` | 검사 판정 배치 수신 → 정지 규칙 → Hold (한 트랜잭션) |
+| POST | `/equipment/{id}/status` | 설비 상태 변경 (고장이면 처리 중인 Lot에 Hold) |
+| POST | `/holds/{id}/disposition` | 처분(해제·재검사·폐기) + 결정자 + 사유 |
+
+- **판정 배치 하나 = Lot 하나의 한 검사 차수**(최대 25장). 하나라도 잘못되면(다른 Lot의 웨이퍼, 약속에 없는 유형 등)
+  배치 전체를 거절한다. 같은 내용의 재전송은 실패가 아니라 중복으로 센다(I8).
+- **판정을 받는 기간**은 INSPECT를 시작한 뒤부터 다음 공정 투입 전까지이고, 차수는 Lot의 현재 차수와 같아야 한다.
+- **정지 규칙**([config/mes.yaml](config/mes.yaml) `stop_rule`): 불량 8종 중 하나로 판정된 웨이퍼가 같은 Lot·같은 차수에
+  1장 이상이면 Hold. 장수는 판정 건수가 아니라 서로 다른 웨이퍼 수로 센다. 같은 Lot에 판정이 동시에 들어와도
+  Lot 행을 잠근 뒤 세므로 한 번에 하나씩 센다. 같은 Lot·같은 차수에서 규칙 Hold는 한 번만 연다.
+- **오류 → HTTP**: 입력 형식 오류 422, 없는 대상 404, 상태 규칙 위반 409, 경쟁 상황에서 DB 제약에 걸린 오류 409,
+  예상 못 한 오류는 스택을 로그로 남기고 500.
+
+### API 실행과 판정 전송
+
+```bash
+docker compose up -d --wait
+.venv/bin/python -m mes.init_db --reset          # 개발용 DB(wafer_mes)에 스키마·기준정보
+.venv/bin/uvicorn mes.api:app --port 8000        # 다른 터미널에서
+../SKALA_CNN-Optimization/.venv/bin/python -m equipment.send_results   # 시험용 Lot 판정 전송
+```
+
+장비 역할 스크립트는 작업 지시를 내리는 역할(Lot 생성, 공정 투입·완료)도 함께 맡는다. Lot마다 공정 순서대로 진행하고,
+검사 공정에서 판정을 보낸 뒤, Hold가 열린 Lot은 다음 공정(SHIP) 투입이 막혀 멈춘다. 작업 지시 ID를 `{Lot}-{공정}`으로
+정해 같은 파일을 다시 보내도 같은 요청이 된다.
+
+| 실행 | 보낸 판정 | 새 기록 | 중복 | 새 Hold | 기존 Hold | FINISHED Lot | Hold로 멈춘 Lot | 시간 |
+|---|---|---|---|---|---|---|---|---|
+| 첫 실행 | 51,087 | 51,087 | 0 | 1,952 | 0 | 410 | 1,952 | 164초 |
+| 같은 파일 재실행 | 51,087 | 0 | 51,087 | 0 | 1,952 | 410 | 1,952 | 146초 |
+
+멈춘 Lot 1,952개(82.6%)는 4단계에서 같은 규칙을 판정 파일에 적용해 계산한 수와 같다.
 
 ## 4단계: 검사 모델 Lot 단위 재평가
 
@@ -206,6 +261,8 @@ Edge-Loc·Loc 등으로 판정한다(검증용 Lot의 라벨 none 웨이퍼 중 
 ## 한계 (현재까지)
 
 - 공정 순서, 설비 목록·상태는 합성값이다.
+- 실제 장비 통신 규격(SECS/GEM) 대신 HTTP를 썼다. 장비 역할 스크립트가 작업 지시를 내리는 역할도 함께 맡는다.
+- 재검사(RETEST)가 검사 설비를 다시 쓰는 과정은 표현하지 않는다(Lot이 설비에 올라가지 않은 채 새 차수 판정을 받는다).
 
 - **none 클래스에 라벨 없는 웨이퍼가 섞여 학습됐다.** 원본 전처리가 라벨 없는 웨이퍼도 `none`으로 넣었기 때문이다.
   학습용 축소 데이터의 none 또는 라벨 없음 5,000장 중 실제 라벨 none은 974장, 라벨 없음은 4,026장이다.
