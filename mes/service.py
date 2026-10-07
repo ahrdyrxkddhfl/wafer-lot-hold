@@ -1,9 +1,13 @@
 """MES 핵심 동작: Lot 생성, 공정 투입·완료, 설비 상태 변경, Hold 열기·처분.
 
 모든 함수는 autocommit 연결을 받아 안에서 트랜잭션 하나를 연다.
-Lot을 바꾸는 동작은 먼저 lot 행을 `SELECT ... FOR UPDATE`로 잠근다. 같은 Lot에 대한 요청이
-동시에 와도 한 번에 하나씩 검사·기록되게 하기 위해서다. 설비도 필요하면 Lot 다음에 잠근다
-(잠그는 순서를 항상 Lot → 설비로 맞춰 교착을 피한다).
+Lot을 바꾸는 동작은 먼저 lot 행을 잠근다. 같은 Lot에 대한 요청이 동시에 와도 한 번에 하나씩
+검사·기록되게 하기 위해서다. 설비도 필요하면 Lot 다음에 잠근다(설비 DOWN 처리만 예외, set_equipment_status 참고).
+
+행 잠금 규칙: 이 프로젝트는 기본키를 바꾸지 않으므로 행 잠금은 모두 `FOR NO KEY UPDATE`를 쓴다.
+`FOR UPDATE`는 외래키 확인이 참조 행에 거는 `FOR KEY SHARE`와도 충돌해, 그 행을 참조하는 행을 넣는
+다른 트랜잭션을 코드에 보이지 않게 기다리게 만든다(실제로 설비 DOWN과 track_out이 교착했다).
+`FOR NO KEY UPDATE`끼리는 충돌하므로 같은 Lot·같은 설비를 동시에 바꾸지 못하는 직렬화는 그대로다.
 """
 import logging
 from dataclasses import dataclass
@@ -18,6 +22,9 @@ logger = logging.getLogger(__name__)
 EQUIPMENT_STATUSES = ("AVAILABLE", "DOWN", "MAINTENANCE")
 DISPOSITION_ACTIONS = ("RELEASE", "RETEST", "SCRAP")
 MANUAL_RULE = "MANUAL"
+EQUIPMENT_DOWN_RULE = "EQUIPMENT_DOWN"
+# 검사 판정을 받는 공정. config/mes.yaml의 route에 반드시 있어야 한다(seed_master_data가 확인).
+INSPECT_STEP = "INSPECT"
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,13 @@ class WorkOrderResult:
     step_code: str
     equipment_id: str
     status: str
+    already_processed: bool
+
+
+@dataclass(frozen=True)
+class DispositionResult:
+    """처분 결과. 같은 내용의 처분 요청이 다시 오면 already_processed=True로 기존 처분을 돌려준다."""
+    disposition_id: int
     already_processed: bool
 
 
@@ -48,7 +62,7 @@ def _require_text(value: str | None, field: str, rule: str) -> str:
 def _lock_lot(cur: psycopg.Cursor, lot_id: str) -> dict:
     """Lot 행을 잠그고 읽는다. 같은 Lot을 바꾸려는 다른 트랜잭션은 커밋될 때까지 여기서 기다린다."""
     cur.execute("SELECT lot_id, status, current_step_code, inspect_round FROM lot "
-                "WHERE lot_id = %s FOR UPDATE", (lot_id,))
+                "WHERE lot_id = %s FOR NO KEY UPDATE", (lot_id,))
     lot = cur.fetchone()
     if lot is None:
         raise RuleViolation("NOT_FOUND", f"Lot 없음: {lot_id}")
@@ -58,11 +72,11 @@ def _lock_lot(cur: psycopg.Cursor, lot_id: str) -> dict:
 def _lock_equipment(cur: psycopg.Cursor, equipment_id: str) -> dict:
     """설비 행을 잠그고 읽는다.
 
-    FOR SHARE가 아니라 FOR UPDATE를 쓴다. FOR SHARE는 여러 트랜잭션이 함께 잡을 수 있어서
-    두 Lot이 같은 설비를 동시에 "비어 있음"으로 읽을 수 있기 때문이다(I11).
+    FOR SHARE는 여러 트랜잭션이 함께 잡을 수 있어서 두 Lot이 같은 설비를 동시에 "비어 있음"으로
+    읽을 수 있다(I11). FOR NO KEY UPDATE는 서로 충돌하므로 한 번에 하나만 잡는다(모듈 설명의 행 잠금 규칙).
     """
     cur.execute("SELECT equipment_id, step_code, status FROM equipment "
-                "WHERE equipment_id = %s FOR UPDATE", (equipment_id,))
+                "WHERE equipment_id = %s FOR NO KEY UPDATE", (equipment_id,))
     eq = cur.fetchone()
     if eq is None:
         raise RuleViolation("NOT_FOUND", f"설비 없음: {equipment_id}")
@@ -115,9 +129,24 @@ def create_lot(conn: psycopg.Connection, lot_id: str, wafers: list[tuple[str, in
     logger.info("Lot 생성 %s (웨이퍼 %d장)", lot_id, len(wafers))
 
 
+def _started_lot_on(cur: psycopg.Cursor, equipment_id: str) -> str | None:
+    """설비에서 처리 중(STARTED)인 Lot ID. 없으면 None."""
+    cur.execute("SELECT lot_id FROM work_order WHERE equipment_id = %s AND status = 'STARTED'",
+                (equipment_id,))
+    row = cur.fetchone()
+    return None if row is None else row["lot_id"]
+
+
 def set_equipment_status(conn: psycopg.Connection, equipment_id: str, status: str,
-                         changed_by: str, reason: str) -> None:
+                         changed_by: str, reason: str) -> HoldResult | None:
     """설비 상태를 바꾸고 이력을 남긴다.
+
+    MAINTENANCE(계획 정비)는 처리 중인 Lot이 있으면 거절한다(I12).
+    DOWN(고장)은 받고, 그 설비에서 처리 중인 Lot에 같은 트랜잭션으로 EQUIPMENT_DOWN Hold를 연다.
+
+    잠금 순서는 다른 함수와 반대로 설비 → Lot이다. 그래도 교착이 없는 이유: Lot을 잡은 채 설비를 기다리는
+    함수는 track_in뿐인데, track_in은 처리 중인 Lot(I7)과 다른 공정 설비(EQUIPMENT_STEP)를 설비 잠금 전에
+    거절하므로, 이 설비에서 처리 중인 Lot을 잡고 이 설비를 기다리는 트랜잭션은 생기지 않는다.
 
     Args:
         conn: autocommit 연결.
@@ -125,22 +154,42 @@ def set_equipment_status(conn: psycopg.Connection, equipment_id: str, status: st
         status: AVAILABLE, DOWN, MAINTENANCE 중 하나.
         changed_by: 바꾼 사람.
         reason: 사유.
+
+    Returns:
+        DOWN으로 Hold를 열었거나 이미 열려 있던 Hold가 있으면 그 결과, 처리 중인 Lot이 없으면 None.
+
+    Raises:
+        RuleViolation: I12에 어긋나거나 입력이 잘못됐을 때.
     """
     if status not in EQUIPMENT_STATUSES:
         raise RuleViolation("INVALID", f"알 수 없는 설비 상태: {status}")
     _require_text(changed_by, "changed_by", "INVALID")
     _require_text(reason, "reason", "INVALID")
+    hold = None
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
         eq = _lock_equipment(cur, equipment_id)
         if eq["status"] == status:
             raise RuleViolation("INVALID", f"{equipment_id}는 이미 {status}")
+        busy_lot = _started_lot_on(cur, equipment_id)
+        if status == "MAINTENANCE" and busy_lot is not None:
+            raise RuleViolation("I12", f"{equipment_id}는 {busy_lot} 처리 중이라 정비로 바꿀 수 없음")
+
         cur.execute("UPDATE equipment SET status = %s, updated_at = now() WHERE equipment_id = %s",
                     (status, equipment_id))
         cur.execute("INSERT INTO equipment_status_history "
                     "(equipment_id, from_status, to_status, changed_by, reason) "
-                    "VALUES (%s, %s, %s, %s, %s)",
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING history_id",
                     (equipment_id, eq["status"], status, changed_by, reason))
+        history_id = cur.fetchone()["history_id"]
+
+        if status == "DOWN" and busy_lot is not None:
+            _lock_lot(cur, busy_lot)
+            # 잠금을 기다리는 동안 그 Lot이 완료됐을 수 있으므로 잠근 뒤 다시 확인한다.
+            if _started_lot_on(cur, equipment_id) == busy_lot:
+                hold = open_hold(conn, busy_lot, EQUIPMENT_DOWN_RULE,
+                                 trigger_equipment_history_id=history_id)
     logger.info("설비 %s: %s -> %s", equipment_id, eq["status"], status)
+    return hold
 
 
 def track_in(conn: psycopg.Connection, work_order_id: str, lot_id: str, step_code: str,
@@ -190,16 +239,23 @@ def track_in(conn: psycopg.Connection, work_order_id: str, lot_id: str, step_cod
         if step_code != lot["current_step_code"]:
             raise RuleViolation("I1", f"{lot_id}의 다음 공정은 {lot['current_step_code']} (요청 {step_code})")
 
+        # 교착 방지 전제: Lot을 잡은 채 설비 잠금을 기다리는 것은 "이 공정의 설비에 처음 투입하는" 요청뿐이어야 한다.
+        # 그래야 설비 DOWN 처리(설비 → 그 설비에서 처리 중인 Lot 순서로 잠금)와 서로 기다리지 않는다.
+        #  - 처리 중 확인(I7)은 위에서 설비 잠금 전에 끝냈다.
+        #  - 공정-설비 일치는 바뀌지 않는 기준정보라 잠금 없이 읽어 여기서 먼저 확인한다.
+        cur.execute("SELECT step_code FROM equipment WHERE equipment_id = %s", (equipment_id,))
+        eq_step = cur.fetchone()
+        if eq_step is None:
+            raise RuleViolation("NOT_FOUND", f"설비 없음: {equipment_id}")
+        if eq_step["step_code"] != step_code:
+            raise RuleViolation("EQUIPMENT_STEP", f"{equipment_id}는 {eq_step['step_code']} 설비")
+
         eq = _lock_equipment(cur, equipment_id)
-        if eq["step_code"] != step_code:
-            raise RuleViolation("EQUIPMENT_STEP", f"{equipment_id}는 {eq['step_code']} 설비")
         if eq["status"] != "AVAILABLE":
             raise RuleViolation("I6", f"{equipment_id} 상태 {eq['status']}")
-        cur.execute("SELECT lot_id FROM work_order WHERE equipment_id = %s AND status = 'STARTED'",
-                    (equipment_id,))
-        busy = cur.fetchone()
-        if busy is not None:
-            raise RuleViolation("I11", f"{equipment_id}는 {busy['lot_id']} 처리 중")
+        busy_lot = _started_lot_on(cur, equipment_id)
+        if busy_lot is not None:
+            raise RuleViolation("I11", f"{equipment_id}는 {busy_lot} 처리 중")
 
         cur.execute("INSERT INTO work_order (work_order_id, lot_id, step_code, equipment_id, status) "
                     "VALUES (%s, %s, %s, %s, 'STARTED')",
@@ -260,17 +316,21 @@ def track_out(conn: psycopg.Connection, work_order_id: str) -> WorkOrderResult:
 
 
 def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
-              trigger_result_id: int | None = None, opened_by: str | None = None) -> HoldResult:
+              trigger_result_id: int | None = None, trigger_equipment_history_id: int | None = None,
+              opened_by: str | None = None) -> HoldResult:
     """Lot에 Hold를 연다. 이미 열린 Hold가 있으면 새로 만들지 않고 그 Hold를 돌려준다(I9).
 
-    규칙이 연 Hold는 trigger_result_id(그 판정 결과), 사람이 연 Hold는 opened_by와
-    rule_name='MANUAL' 중 정확히 한쪽만 준다.
+    무엇이 열었는지를 정확히 하나만 준다.
+        판정 규칙: trigger_result_id(그 판정 결과)
+        설비 고장: trigger_equipment_history_id(그 상태 변경 이력), rule_name='EQUIPMENT_DOWN'
+        사람: opened_by, rule_name='MANUAL'
 
     Args:
         conn: autocommit 연결(바깥 트랜잭션 안에서 부르면 savepoint가 된다).
         lot_id: Lot ID.
         rule_name: Hold를 연 규칙 이름.
         trigger_result_id: Hold를 열게 한 inspection_result ID.
+        trigger_equipment_history_id: Hold를 열게 한 equipment_status_history ID.
         opened_by: Hold를 연 사람.
 
     Returns:
@@ -280,12 +340,16 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
         RuleViolation: I10에 어긋나거나 입력이 잘못됐을 때.
     """
     _require_text(rule_name, "rule_name", "INVALID")
-    if (trigger_result_id is None) == (opened_by is None):
-        raise RuleViolation("INVALID", "trigger_result_id와 opened_by 중 정확히 하나만 줘야 함")
+    sources = [trigger_result_id, trigger_equipment_history_id, opened_by]
+    if sum(s is not None for s in sources) != 1:
+        raise RuleViolation("INVALID", "trigger_result_id, trigger_equipment_history_id, opened_by 중 "
+                                       "정확히 하나만 줘야 함")
     if opened_by is not None:
         _require_text(opened_by, "opened_by", "INVALID")
     if (opened_by is not None) != (rule_name == MANUAL_RULE):
         raise RuleViolation("INVALID", f"사람이 연 Hold만 rule_name이 {MANUAL_RULE}")
+    if (trigger_equipment_history_id is not None) != (rule_name == EQUIPMENT_DOWN_RULE):
+        raise RuleViolation("INVALID", f"설비 고장으로 연 Hold만 rule_name이 {EQUIPMENT_DOWN_RULE}")
 
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
         lot = _lock_lot(cur, lot_id)
@@ -296,9 +360,10 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
         existing = _open_hold_id(cur, lot_id)
         if existing is not None:
             return HoldResult(existing, created=False)
-        cur.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, opened_by, inspect_round) "
-                    "VALUES (%s, %s, %s, %s, %s) RETURNING hold_id",
-                    (lot_id, rule_name, trigger_result_id, opened_by, lot["inspect_round"]))
+        cur.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, trigger_equipment_history_id, "
+                    "opened_by, inspect_round) VALUES (%s, %s, %s, %s, %s, %s) RETURNING hold_id",
+                    (lot_id, rule_name, trigger_result_id, trigger_equipment_history_id, opened_by,
+                     lot["inspect_round"]))
         hold_id = cur.fetchone()["hold_id"]
         _add_history(cur, lot_id, "HOLD", step_code=lot["current_step_code"], hold_id=hold_id)
     logger.info("Hold %d 열림: %s (%s)", hold_id, lot_id, rule_name)
@@ -306,7 +371,7 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
 
 
 def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by: str,
-                 reason: str) -> int:
+                 reason: str) -> DispositionResult:
     """열린 Hold를 처분(해제·재검사·폐기)하고 닫는다.
 
     RELEASE는 Hold만 닫는다. RETEST는 lot.inspect_round를 1 올린다(작업 지시는 새로 만들지 않음).
@@ -320,10 +385,11 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
         reason: 사유.
 
     Returns:
-        처분 ID.
+        처분 결과. 같은 내용으로 이미 처분된 Hold면 already_processed=True로 기존 처분을 돌려준다.
 
     Raises:
-        RuleViolation: 결정자·사유가 비었거나(I5) Hold가 없거나 이미 닫혔을 때.
+        RuleViolation: 결정자·사유가 비었거나(I5), Hold가 없거나, 다른 내용으로 이미 처분됐거나(HOLD_CLOSED),
+            INSPECT 처리 중이 아닌 Lot을 재검사하려 할 때(RETEST_NOT_AT_INSPECT).
     """
     _require_text(decided_by, "decided_by", "I5")
     _require_text(reason, "reason", "I5")
@@ -336,9 +402,19 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
         if row is None:
             raise RuleViolation("NOT_FOUND", f"Hold 없음: {hold_id}")
         lot = _lock_lot(cur, row["lot_id"])
-        cur.execute("SELECT closed_at FROM hold WHERE hold_id = %s", (hold_id,))
-        if cur.fetchone()["closed_at"] is not None:
-            raise RuleViolation("INVALID", f"이미 처분된 Hold: {hold_id}")
+        cur.execute("SELECT disposition_id, action, decided_by, reason FROM hold_disposition "
+                    "WHERE hold_id = %s", (hold_id,))
+        done = cur.fetchone()
+        if done is not None:
+            # 작업 지시(I3)와 같은 방식: 같은 내용의 재요청은 기존 결과, 다른 내용이면 거절.
+            if (done["action"], done["decided_by"], done["reason"]) != (action, decided_by, reason):
+                raise RuleViolation("HOLD_CLOSED", f"Hold {hold_id}는 이미 {done['action']}로 처분됨")
+            return DispositionResult(done["disposition_id"], already_processed=True)
+        # 재검사는 같은 웨이퍼를 INSPECT에서 다시 판정받는 것이므로, INSPECT 처리 중이 아니면 차수를 올리지 않는다.
+        # 다른 공정에서 차수가 오르면 나중에 받을 첫 판정(1차)이 차수 불일치로 거절된다.
+        if action == "RETEST" and (lot["status"], lot["current_step_code"]) != ("IN_PROCESS", INSPECT_STEP):
+            raise RuleViolation("RETEST_NOT_AT_INSPECT",
+                                f"{lot['lot_id']}는 {lot['current_step_code']} {lot['status']}")
 
         cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason) "
                     "VALUES (%s, %s, %s, %s) RETURNING disposition_id",
@@ -354,4 +430,4 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
             cur.execute("UPDATE lot SET status = 'SCRAPPED' WHERE lot_id = %s", (lot["lot_id"],))
         _add_history(cur, lot["lot_id"], action, step_code=lot["current_step_code"], hold_id=hold_id)
     logger.info("Hold %d 처분 %s by %s", hold_id, action, decided_by)
-    return disposition_id
+    return DispositionResult(disposition_id, already_processed=False)

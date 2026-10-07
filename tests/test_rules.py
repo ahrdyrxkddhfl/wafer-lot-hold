@@ -14,6 +14,8 @@ from mes.service import create_lot, dispose_hold, open_hold, set_equipment_statu
 # 잠금이 있으면 두 번째 요청은 이 시간 동안 잠금에서 기다린다. 너무 짧으면 경쟁이 재현되지 않을 수 있다.
 RACE_WINDOW_SECONDS = 0.3
 THREAD_TIMEOUT_SECONDS = 10
+# 잠금을 기다리면 안 되는 요청에 거는 대기 한도. 넘으면 LockNotAvailable로 실패해 "기다렸다"는 것이 드러난다.
+LOCK_TIMEOUT_MS = 500
 
 
 @pytest.fixture
@@ -201,6 +203,37 @@ def test_i5_db_rejects_blank_or_null_reason(conn):
         conn.execute(insert, (hold_id, None))
 
 
+# ── 처분 재요청 ─────────────────────────────────────────────
+
+def test_same_disposition_twice_returns_existing(conn):
+    make_lot(conn, "LOT_A")
+    hold_id = manual_hold(conn, "LOT_A")
+    first = dispose_hold(conn, hold_id, "RELEASE", "engineer", "확인 완료")
+    second = dispose_hold(conn, hold_id, "RELEASE", "engineer", "확인 완료")
+
+    assert not first.already_processed and second.already_processed
+    assert first.disposition_id == second.disposition_id
+    assert count(conn, "SELECT count(*) FROM hold_disposition") == 1
+    assert count(conn, "SELECT count(*) FROM lot_history WHERE event = 'RELEASE'") == 1
+
+
+@pytest.mark.parametrize("action,decided_by,reason", [
+    ("SCRAP", "engineer", "확인 완료"),
+    ("RELEASE", "other", "확인 완료"),
+    ("RELEASE", "engineer", "다른 사유"),
+])
+def test_different_disposition_on_closed_hold_is_rejected(conn, action, decided_by, reason):
+    make_lot(conn, "LOT_A")
+    hold_id = manual_hold(conn, "LOT_A")
+    dispose_hold(conn, hold_id, "RELEASE", "engineer", "확인 완료")
+
+    with pytest.raises(RuleViolation) as e:
+        dispose_hold(conn, hold_id, action, decided_by, reason)
+    assert e.value.rule == "HOLD_CLOSED"
+    assert lot_row(conn, "LOT_A")[0] == "WAITING"
+    assert count(conn, "SELECT count(*) FROM hold_disposition") == 1
+
+
 # ── I6 정지·정비 중인 설비에 투입 ─────────────────────────────
 
 @pytest.mark.parametrize("status", ["DOWN", "MAINTENANCE"])
@@ -221,6 +254,21 @@ def test_equipment_of_other_step_is_rejected(conn, route, eqs):
     make_lot(conn, "LOT_A")
     with pytest.raises(RuleViolation) as e:
         track_in(conn, "WO-1", "LOT_A", route[0], eqs[route[1]][0])
+    assert e.value.rule == "EQUIPMENT_STEP"
+
+
+def test_equipment_step_is_checked_without_waiting_for_equipment_lock(conn, connect_test, route, eqs):
+    """다른 공정 설비로의 투입은 그 설비의 잠금을 기다리지 않고 바로 거절돼야 한다.
+
+    기다리게 되면 "Lot을 잡은 채 설비를 기다리는" 경로가 생겨 설비 DOWN 처리(설비 → Lot)와 교착할 수 있다.
+    """
+    other_eq = eqs[route[1]][0]
+    make_lot(conn, "LOT_A")  # route[0] 대기
+    conn.execute("SELECT set_config('lock_timeout', %s, false)", (f"{LOCK_TIMEOUT_MS}ms",))
+    with connect_test() as holder, holder.transaction():
+        holder.execute("SELECT 1 FROM equipment WHERE equipment_id = %s FOR NO KEY UPDATE", (other_eq,))
+        with pytest.raises(RuleViolation) as e:
+            track_in(conn, "WO-1", "LOT_A", route[0], other_eq)
     assert e.value.rule == "EQUIPMENT_STEP"
 
 
@@ -274,6 +322,9 @@ def test_i9_db_rejects_second_open_hold(conn):
     ("MANUAL", {"trigger_result_id": 1, "opened_by": "x"}),  # 둘 다 있음
     ("DEFECT_RULE", {"opened_by": "tester"}),                # 사람이 열었는데 MANUAL이 아님
     ("MANUAL", {"opened_by": "   "}),                        # 공백 이름
+    ("MANUAL", {"trigger_equipment_history_id": 1, "opened_by": "x"}),  # 둘 다 있음
+    ("DEFECT_RULE", {"trigger_equipment_history_id": 1}),    # 설비 고장인데 EQUIPMENT_DOWN이 아님
+    ("EQUIPMENT_DOWN", {"trigger_result_id": 1}),            # EQUIPMENT_DOWN인데 설비 이력이 없음
 ])
 def test_hold_needs_exactly_one_opener(conn, rule_name, kwargs):
     make_lot(conn, "LOT_A")
@@ -287,6 +338,13 @@ def test_hold_db_rejects_missing_opener(conn):
     make_lot(conn, "LOT_A")
     with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute("INSERT INTO hold (lot_id, rule_name, inspect_round) VALUES ('LOT_A', 'MANUAL', 1)")
+
+
+def test_hold_db_rejects_equipment_down_rule_without_equipment_history(conn):
+    make_lot(conn, "LOT_A")
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO hold (lot_id, rule_name, opened_by, inspect_round) "
+                     "VALUES ('LOT_A', 'EQUIPMENT_DOWN', 'tester', 1)")
 
 
 # ── I10 폐기된 Lot 진행 ──────────────────────────────────────
@@ -341,13 +399,138 @@ def test_i11_concurrent_track_in_to_same_equipment_only_one_succeeds(conn, conne
                  (eq1,)) == 1
 
 
+# ── I12 처리 중인 설비를 계획 정비로 / 설비 고장 시 자동 Hold ────────────
+
+def test_i12_maintenance_rejected_while_equipment_processing(conn, route, eqs):
+    eq1, eq2 = eqs[route[0]][:2]
+    make_lot(conn, "LOT_A")
+    track_in(conn, "WO-A", "LOT_A", route[0], eq1)
+
+    with pytest.raises(RuleViolation) as e:
+        set_equipment_status(conn, eq1, "MAINTENANCE", "engineer", "정기 점검")
+    assert e.value.rule == "I12"
+    assert count(conn, "SELECT count(*) FROM equipment WHERE equipment_id = %s AND status = 'AVAILABLE'",
+                 (eq1,)) == 1
+    assert count(conn, "SELECT count(*) FROM equipment_status_history") == 0
+    assert set_equipment_status(conn, eq2, "MAINTENANCE", "engineer", "정기 점검") is None
+
+
+def test_down_opens_equipment_down_hold_on_processing_lot(conn, route, eqs):
+    eq1 = eqs[route[0]][0]
+    make_lot(conn, "LOT_A")
+    track_in(conn, "WO-A", "LOT_A", route[0], eq1)
+
+    result = set_equipment_status(conn, eq1, "DOWN", "engineer", "고장")
+    assert result is not None and result.created
+    history_id = conn.execute("SELECT history_id FROM equipment_status_history WHERE equipment_id = %s",
+                              (eq1,)).fetchone()[0]
+    assert conn.execute("SELECT lot_id, rule_name, trigger_equipment_history_id, closed_at FROM hold "
+                        "WHERE hold_id = %s", (result.hold_id,)).fetchone() == \
+        ("LOT_A", "EQUIPMENT_DOWN", history_id, None)
+    assert count(conn, "SELECT count(*) FROM lot_history WHERE event = 'HOLD'") == 1
+    with pytest.raises(RuleViolation) as e:
+        track_out(conn, "WO-A")
+    assert e.value.rule == "I4"
+
+
+def test_down_on_idle_equipment_opens_no_hold(conn, route, eqs):
+    assert set_equipment_status(conn, eqs[route[0]][0], "DOWN", "engineer", "고장") is None
+    assert count(conn, "SELECT count(*) FROM hold") == 0
+
+
+def test_down_keeps_existing_hold_of_processing_lot(conn, route, eqs):
+    eq1 = eqs[route[0]][0]
+    make_lot(conn, "LOT_A")
+    track_in(conn, "WO-A", "LOT_A", route[0], eq1)
+    manual_id = manual_hold(conn, "LOT_A")
+
+    result = set_equipment_status(conn, eq1, "DOWN", "engineer", "고장")
+    assert result is not None and not result.created and result.hold_id == manual_id
+    assert conn.execute("SELECT rule_name FROM hold WHERE closed_at IS NULL").fetchall() == [("MANUAL",)]
+
+
+def no_deadlock(outcomes: list[tuple[str, object]]) -> None:
+    for kind, value in outcomes:
+        assert not isinstance(value, psycopg.errors.DeadlockDetected), outcomes
+
+
+def test_down_and_track_in_to_same_equipment_do_not_deadlock(conn, connect_test, monkeypatch, route, eqs):
+    eq1 = eqs[route[0]][0]
+    make_lot(conn, "LOT_B")
+    monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
+    monkeypatch.setattr(service, "_lock_equipment", slow_after(service._lock_equipment))
+
+    outcomes = run_at_same_time(connect_test, [
+        lambda c: track_in(c, "WO-B", "LOT_B", route[0], eq1),
+        lambda c: set_equipment_status(c, eq1, "DOWN", "engineer", "고장"),
+    ])
+
+    no_deadlock(outcomes)
+    (in_kind, in_value), (down_kind, _) = outcomes
+    assert down_kind == "ok", outcomes
+    open_down_holds = count(conn, "SELECT count(*) FROM hold WHERE lot_id = 'LOT_B' "
+                                  "AND rule_name = 'EQUIPMENT_DOWN' AND closed_at IS NULL")
+    if in_kind == "ok":   # 투입이 먼저: 고장 처리가 그 Lot에 Hold를 연다
+        assert open_down_holds == 1
+    else:                 # 고장이 먼저: 투입이 I6으로 거절된다
+        assert isinstance(in_value, RuleViolation) and in_value.rule == "I6", outcomes
+        assert open_down_holds == 0 and count(conn, "SELECT count(*) FROM work_order") == 0
+
+
+def test_down_and_track_out_on_same_equipment_do_not_deadlock(conn, connect_test, monkeypatch, route, eqs):
+    eq1 = eqs[route[0]][0]
+    make_lot(conn, "LOT_A")
+    track_in(conn, "WO-A", "LOT_A", route[0], eq1)
+    monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
+    monkeypatch.setattr(service, "_lock_equipment", slow_after(service._lock_equipment))
+
+    outcomes = run_at_same_time(connect_test, [
+        lambda c: track_out(c, "WO-A"),
+        lambda c: set_equipment_status(c, eq1, "DOWN", "engineer", "고장"),
+    ])
+
+    no_deadlock(outcomes)
+    (out_kind, out_value), (down_kind, _) = outcomes
+    assert down_kind == "ok", outcomes
+    open_holds = count(conn, "SELECT count(*) FROM hold WHERE lot_id = 'LOT_A' AND closed_at IS NULL")
+    if out_kind == "ok":  # 완료가 먼저: 고장 처리는 잠근 뒤 다시 확인해 Hold를 열지 않는다
+        assert open_holds == 0
+        assert lot_row(conn, "LOT_A")[:2] == ("WAITING", route[1])
+    else:                 # 고장이 먼저: Hold가 열려 완료가 I4로 막힌다
+        assert isinstance(out_value, RuleViolation) and out_value.rule == "I4", outcomes
+        assert open_holds == 1
+
+
 # ── 처분 RETEST ─────────────────────────────────────────────
+
+def track_in_to_inspect(conn: psycopg.Connection, lot_id: str, route: list[str],
+                        eqs: dict[str, list[str]]) -> str:
+    """검사 공정 앞까지 처리하고 검사 공정에 투입한다. 검사 공정 작업 지시 ID를 돌려준다."""
+    for step in route[:route.index(service.INSPECT_STEP)]:
+        track_in(conn, f"{lot_id}-{step}", lot_id, step, eqs[step][0])
+        track_out(conn, f"{lot_id}-{step}")
+    wo_id = f"{lot_id}-{service.INSPECT_STEP}"
+    track_in(conn, wo_id, lot_id, service.INSPECT_STEP, eqs[service.INSPECT_STEP][0])
+    return wo_id
+
 
 def test_retest_increments_round_and_keeps_lot_in_process(conn, route, eqs):
     make_lot(conn, "LOT_A")
-    track_in(conn, "WO-1", "LOT_A", route[0], eqs[route[0]][0])
+    wo_id = track_in_to_inspect(conn, "LOT_A", route, eqs)
     dispose_hold(conn, manual_hold(conn, "LOT_A"), "RETEST", "engineer", "재검사 요청")
 
-    assert lot_row(conn, "LOT_A") == ("IN_PROCESS", route[0], 2)
+    assert lot_row(conn, "LOT_A") == ("IN_PROCESS", service.INSPECT_STEP, 2)
     assert count(conn, "SELECT count(*) FROM hold WHERE closed_at IS NULL") == 0
-    assert not track_out(conn, "WO-1").already_processed
+    assert not track_out(conn, wo_id).already_processed
+
+
+def test_retest_only_allowed_at_inspect(conn):
+    service.create_lot(conn, "LOT_R", [("LOT_R_W01", 1)])
+    h = service.open_hold(conn, "LOT_R", "MANUAL", opened_by="engineer")
+    with pytest.raises(RuleViolation) as e:
+        service.dispose_hold(conn, h.hold_id, "RETEST", "engineer", "재검사 요청")
+    assert e.value.rule == "RETEST_NOT_AT_INSPECT"
+    row = conn.execute("SELECT current_step_code, inspect_round FROM lot WHERE lot_id='LOT_R'").fetchone()
+    assert row == ("STEP_1", 1)
+    assert count(conn, "SELECT count(*) FROM hold WHERE closed_at IS NULL") == 1
+    assert count(conn, "SELECT count(*) FROM hold_disposition") == 0

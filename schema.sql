@@ -75,18 +75,22 @@ CREATE TABLE inspection_result (
     UNIQUE (wafer_id, model_sha256, inspect_round)  -- I8
 );
 
--- Hold(정지). 규칙이 열었으면 trigger_result_id, 사람이 열었으면 opened_by 중 정확히 하나가 있다.
+-- Hold(정지). 무엇이 열었는지 정확히 하나가 있다.
+--   판정 규칙: trigger_result_id / 설비 고장: trigger_equipment_history_id (rule_name 'EQUIPMENT_DOWN')
+--   사람: opened_by (rule_name 'MANUAL')
 CREATE TABLE hold (
-    hold_id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    lot_id            text NOT NULL REFERENCES lot (lot_id),
-    rule_name         text NOT NULL CHECK (btrim(rule_name) <> ''),  -- 사람이 연 Hold는 'MANUAL'
-    trigger_result_id bigint REFERENCES inspection_result (result_id),
-    opened_by         text CHECK (btrim(opened_by) <> ''),
-    inspect_round     int  NOT NULL CHECK (inspect_round >= 1),
-    opened_at         timestamptz NOT NULL DEFAULT now(),
-    closed_at         timestamptz,  -- 처분과 같은 트랜잭션에서 채운다
-    CHECK (num_nonnulls(trigger_result_id, opened_by) = 1),
-    CHECK ((opened_by IS NOT NULL) = (rule_name = 'MANUAL'))
+    hold_id                      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    lot_id                       text NOT NULL REFERENCES lot (lot_id),
+    rule_name                    text NOT NULL CHECK (btrim(rule_name) <> ''),
+    trigger_result_id            bigint REFERENCES inspection_result (result_id),
+    trigger_equipment_history_id bigint REFERENCES equipment_status_history (history_id),
+    opened_by                    text CHECK (btrim(opened_by) <> ''),
+    inspect_round                int  NOT NULL CHECK (inspect_round >= 1),
+    opened_at                    timestamptz NOT NULL DEFAULT now(),
+    closed_at                    timestamptz,  -- 처분과 같은 트랜잭션에서 채운다
+    CHECK (num_nonnulls(trigger_result_id, trigger_equipment_history_id, opened_by) = 1),
+    CHECK ((opened_by IS NOT NULL) = (rule_name = 'MANUAL')),
+    CHECK ((trigger_equipment_history_id IS NOT NULL) = (rule_name = 'EQUIPMENT_DOWN'))
 );
 -- I9: Lot당 열린 Hold는 하나.
 CREATE UNIQUE INDEX hold_one_open_per_lot ON hold (lot_id) WHERE closed_at IS NULL;

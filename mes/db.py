@@ -7,6 +7,8 @@ import psycopg
 import yaml
 from dotenv import load_dotenv
 
+from mes.service import INSPECT_STEP
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -79,6 +81,8 @@ def seed_master_data(conn: psycopg.Connection, cfg: dict) -> None:
         conn: 대상 DB 연결.
         cfg: load_config 결과.
     """
+    if INSPECT_STEP not in cfg["route"]:
+        raise ValueError(f"config route에 검사 공정 {INSPECT_STEP}가 없음: {cfg['route']}")
     with conn.transaction(), conn.cursor() as cur:
         cur.executemany("INSERT INTO route_step (step_code, seq) VALUES (%s, %s)",
                         [(step, seq) for seq, step in enumerate(cfg["route"], start=1)])
