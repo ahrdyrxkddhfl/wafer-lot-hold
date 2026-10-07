@@ -70,3 +70,6 @@ output:
   lot_labels: evaluation/lot_test_labels.csv
   stage4_train_history: evaluation/stage4_train_history.csv
   stage4_comparison: evaluation/stage4_comparison.csv
+  # 4단계 보완. 검증용 Lot의 원본 전체 웨이퍼 판정과 정답. 정지 규칙 기준값을 고르는 데만 쓴다.
+  lot_valid_predictions: data/lot_valid_predictions_exp12_lotsplit.csv
+  lot_valid_labels: evaluation/lot_valid_labels.csv

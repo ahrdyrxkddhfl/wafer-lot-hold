@@ -6,7 +6,8 @@
 plan:     Lot 이름 재사용 확인, 분할 결과, 두 Test의 겹침, 시험용 Lot 전체 미리보기, 1에폭 시간(저장 안 함)
 train:    Lot 단위 분할로 12번과 같은 설정으로 학습(MPS), 체크포인트는 artifacts/, 에폭별 기록은 CSV
 evaluate: 12번 모델과 새 모델의 Test 성능 비교(CPU)
-predict:  시험용 Lot의 원본 전체 웨이퍼를 새 모델로 판정(CPU), 판정 파일과 정답 파일을 따로 저장
+predict:  시험용 Lot(--split valid면 검증용 Lot)의 원본 전체 웨이퍼를 새 모델로 판정(CPU),
+          판정 파일과 정답 파일을 따로 저장
 검증이 실패하면 이유를 남기고 exit 1로 멈춘다.
 """
 import argparse
@@ -277,8 +278,15 @@ def cmd_evaluate(cfg: dict) -> None:
     logger.info("저장 %s", cfg["output"]["stage4_comparison"])
 
 
-def cmd_predict(cfg: dict) -> None:
-    """시험용 Lot에 속한 원본 전체 웨이퍼를 새 모델로 판정해 판정 파일과 정답 파일을 저장한다."""
+def cmd_predict(cfg: dict, split: str) -> None:
+    """한 분할(test 또는 valid)의 Lot에 속한 원본 전체 웨이퍼를 새 모델로 판정해 판정 파일과 정답 파일을 저장한다.
+
+    test는 MES에 올릴 데이터, valid는 정지 규칙 기준값을 고르는 데이터다(시험용 Lot으로 고르면 시험에 맞춰 고른 셈).
+
+    Args:
+        cfg: 장비 설정.
+        split: "test" 또는 "valid".
+    """
     p = prepare(cfg)
     m, inf, out = cfg["model"], cfg["inference"], cfg["output"]
     cpu = torch.device(inf["device"])
@@ -286,8 +294,8 @@ def cmd_predict(cfg: dict) -> None:
     model_sha = sha256_of(ckpt)
     model = load_model(ckpt, m["dropout"], m["use_bn"], m["activation"], cpu)
 
-    test_lots = set(p.df_reduced["lotName"].iloc[p.lot_rows["row_test"]])
-    full = p.df[p.df["lotName"].isin(test_lots)].sort_values(["lotName", "waferIndex"]).reset_index(drop=True)
+    split_lots = set(p.df_reduced["lotName"].iloc[p.lot_rows[f"row_{split}"]])
+    full = p.df[p.df["lotName"].isin(split_lots)].sort_values(["lotName", "waferIndex"]).reset_index(drop=True)
     full["wafer_id"] = make_wafer_ids(full["lotName"], full["waferIndex"])
     X_full = np.array([preprocess_wafer_map(w, cfg["data"]["image_size"]) for w in full["waferMap"]],
                       dtype=np.uint8)[:, np.newaxis, :, :]
@@ -305,23 +313,24 @@ def cmd_predict(cfg: dict) -> None:
     predictions["model_sha256"] = model_sha
     labels = pd.DataFrame({"wafer_id": full["wafer_id"], "true_label": full["failureType"],
                            "label_source": full["label_source"]})
-    for frame, key in [(predictions, "lot_predictions"), (labels, "lot_labels")]:
+    prefix = "lot" if split == "test" else f"lot_{split}"
+    for frame, key in [(predictions, f"{prefix}_predictions"), (labels, f"{prefix}_labels")]:
         path = PROJECT_ROOT / out[key]
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path, index=False, float_format="%.6f")
         logger.info("저장 %s (%d행, %.2f MB)", out[key], len(frame), path.stat().st_size / 1e6)
 
     sizes = full.groupby("lotName").size()
-    logger.info("시험용 Lot %d개, 웨이퍼 %d장, Lot당 최소 %d / 중앙값 %.1f / 평균 %.2f / 최대 %d",
-                len(sizes), len(full), sizes.min(), sizes.median(), sizes.mean(), sizes.max())
+    logger.info("%s Lot %d개, 웨이퍼 %d장, Lot당 최소 %d / 중앙값 %.1f / 평균 %.2f / 최대 %d",
+                split, len(sizes), len(full), sizes.min(), sizes.median(), sizes.mean(), sizes.max())
     logger.info("Lot당 웨이퍼 수별 Lot 수: %s",
                 ", ".join(f"{k}장:{v}" for k, v in sizes.value_counts().sort_index().items()))
     labeled = full[full["label_source"] != UNLABELED]
     logger.info("라벨 있음 %d (불량 %d, none %d), 라벨 없음 %d", len(labeled),
                 int((labeled["failureType"] != "none").sum()), int((labeled["failureType"] == "none").sum()),
                 len(full) - len(labeled))
-    in_reduced = full["src_row"].isin(p.df_reduced["src_row"].iloc[p.lot_rows["row_test"]])
-    logger.info("이 중 축소 데이터(Lot 단위 Test)에 있던 웨이퍼 %d, 없던 웨이퍼 %d", int(in_reduced.sum()),
+    in_reduced = full["src_row"].isin(p.df_reduced["src_row"].iloc[p.lot_rows[f"row_{split}"]])
+    logger.info("이 중 축소 데이터(Lot 단위 해당 분할)에 있던 웨이퍼 %d, 없던 웨이퍼 %d", int(in_reduced.sum()),
                 int((~in_reduced).sum()))
     logger.info("waferIndex 최소 %d, 최대 %d", full["waferIndex"].min(), full["waferIndex"].max())
     logger.info("판정 유형 분포\n%s", predictions["pred_label"].value_counts().reindex(p.class_names)
@@ -333,9 +342,14 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=["plan", "train", "evaluate", "predict"])
+    parser.add_argument("--split", choices=["test", "valid"], default="test",
+                        help="predict 대상 분할 (기본 test)")
     args = parser.parse_args()
     cfg = load_config(CONFIG_PATH)
-    {"plan": cmd_plan, "train": cmd_train, "evaluate": cmd_evaluate, "predict": cmd_predict}[args.command](cfg)
+    if args.command == "predict":
+        cmd_predict(cfg, args.split)
+    else:
+        {"plan": cmd_plan, "train": cmd_train, "evaluate": cmd_evaluate}[args.command](cfg)
     return 0
 
 
