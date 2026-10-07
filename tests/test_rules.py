@@ -617,10 +617,12 @@ def test_scrap_closes_all_open_holds_of_lot(conn, route, eqs):
     manual_id = manual_hold(conn, "LOT_A")
     set_equipment_status(conn, eq1, "DOWN", "engineer", "고장")
 
-    dispose_hold(conn, manual_id, "SCRAP", "engineer", "불량 확정")
+    direct = dispose_hold(conn, manual_id, "SCRAP", "engineer", "불량 확정")
     assert count(conn, "SELECT count(*) FROM hold WHERE closed_at IS NULL") == 0
-    assert conn.execute("SELECT action, decided_by, reason FROM hold_disposition ORDER BY disposition_id"
-                        ).fetchall() == [("SCRAP", "engineer", "불량 확정")] * 2
+    # 사람이 직접 결정한 처분은 하나뿐이고, 고장 Hold의 처분은 그 처분에 딸려 닫힌 것으로 남는다.
+    assert conn.execute("SELECT hold_id, action, cascaded_from_disposition_id FROM hold_disposition "
+                        "ORDER BY disposition_id").fetchall() == \
+        [(manual_id, "SCRAP", None), (manual_id + 1, "SCRAP", direct.disposition_id)]
 
 
 # ── 2단계: 판정 수신과 정지 규칙 ─────────────────────────────────
@@ -806,6 +808,23 @@ def test_defect_result_during_equipment_down_hold_is_not_hidden(conn, route, eqs
 
     dispose_hold(conn, r.hold.hold_id, "RELEASE", "engineer", "판정 확인 결과 정상")
     assert not track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0]).already_processed
+
+
+def test_retest_closes_open_rule_hold_of_previous_round(conn, route, eqs, labels, rule):
+    """이전 차수 규칙 Hold가 열린 채 다른 Hold를 재검사하면, 규칙 Hold도 딸려 닫히고 새 차수 판정이 새 규칙 Hold를 연다."""
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    manual_id = manual_hold(conn, "LOT_A")
+    old_rule = send(conn, "LOT_A", wafers("LOT_A", "Center"), labels, rule).hold
+
+    retest = dispose_hold(conn, manual_id, "RETEST", "engineer", "재검사 요청")
+    assert conn.execute("SELECT closed_at IS NOT NULL FROM hold WHERE hold_id = %s", (old_rule.hold_id,)).fetchone()[0]
+    assert conn.execute("SELECT action, cascaded_from_disposition_id FROM hold_disposition WHERE hold_id = %s",
+                        (old_rule.hold_id,)).fetchone() == ("RETEST", retest.disposition_id)
+
+    new_rule = send(conn, "LOT_A", wafers("LOT_A", "Center"), labels, rule, inspect_round=2).hold
+    assert new_rule.created and new_rule.hold_id != old_rule.hold_id
+    assert conn.execute("SELECT trigger_result_id, inspect_round FROM hold WHERE hold_id = %s",
+                        (new_rule.hold_id,)).fetchone() == (result_id(conn, "LOT_A_W01", inspect_round=2), 2)
 
 
 # ── I13 검사 결과 없이 검사 공정 통과 ───────────────────────────

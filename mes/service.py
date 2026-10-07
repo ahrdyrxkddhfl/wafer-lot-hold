@@ -503,10 +503,10 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
     """열린 Hold를 처분(해제·재검사·폐기)하고 닫는다.
 
     RELEASE는 이 Hold만 닫는다. 다른 종류의 열린 Hold가 남아 있으면 Lot은 계속 투입이 막힌다(I4).
-    RETEST는 이 Hold를 닫고 lot.inspect_round를 1 올린다(작업 지시는 새로 만들지 않음).
-    "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에만 허용한다.
-    SCRAP은 Lot을 SCRAPPED(끝 상태)로 두고, 처리 중인 작업 지시를 ABORTED로, 그 Lot의 다른 열린 Hold도
-    같은 결정자·사유의 SCRAP 처분으로 함께 닫는다(폐기된 Lot에 열린 Hold가 남지 않게).
+    RETEST는 이 Hold를 닫고 lot.inspect_round를 1 올린다(작업 지시는 새로 만들지 않음). 그 Lot에 열린 판정 규칙
+    Hold도 함께 닫는다. "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에만 허용한다.
+    SCRAP은 Lot을 SCRAPPED(끝 상태)로 두고, 처리 중인 작업 지시를 ABORTED로, 그 Lot의 다른 열린 Hold도 함께 닫는다.
+    함께 닫힌 Hold의 처분은 cascaded_from_disposition_id로 원래 처분을 가리켜, 사람이 직접 결정한 처분과 구분한다.
 
     Args:
         conn: autocommit 연결.
@@ -547,18 +547,22 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
             raise RuleViolation("RETEST_NOT_AT_INSPECT",
                                 f"{lot['lot_id']}는 {lot['current_step_code']} {lot['status']}")
 
-        to_close = [hold_id]
-        if action == "SCRAP":
-            cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND closed_at IS NULL AND hold_id <> %s "
-                        "ORDER BY hold_id", (lot["lot_id"], hold_id))
-            to_close += [r["hold_id"] for r in cur.fetchall()]
-        for h in to_close:
-            cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason) "
-                        "VALUES (%s, %s, %s, %s) RETURNING disposition_id",
-                        (h, action, decided_by, reason))
-            if h == hold_id:
-                disposition_id = cur.fetchone()["disposition_id"]
-            cur.execute("UPDATE hold SET closed_at = now() WHERE hold_id = %s", (h,))
+        cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason) "
+                    "VALUES (%s, %s, %s, %s) RETURNING disposition_id", (hold_id, action, decided_by, reason))
+        disposition_id = cur.fetchone()["disposition_id"]
+        cur.execute("UPDATE hold SET closed_at = now() WHERE hold_id = %s", (hold_id,))
+
+        # 딸려서 닫을 Hold. 폐기는 그 Lot의 열린 Hold 전부, 재검사는 열린 판정 규칙 Hold
+        # (차수를 올리는 결정은 이전 차수 판정을 더 이상 기준으로 쓰지 않는다는 뜻이다).
+        cascade_sql = {"SCRAP": "", "RETEST": " AND trigger_result_id IS NOT NULL"}.get(action)
+        if cascade_sql is not None:
+            cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND closed_at IS NULL" + cascade_sql +
+                        " ORDER BY hold_id", (lot["lot_id"],))
+            for h in [r["hold_id"] for r in cur.fetchall()]:
+                cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason, "
+                            "cascaded_from_disposition_id) VALUES (%s, %s, %s, %s, %s)",
+                            (h, action, decided_by, reason, disposition_id))
+                cur.execute("UPDATE hold SET closed_at = now() WHERE hold_id = %s", (h,))
         if action == "RETEST":
             cur.execute("UPDATE lot SET inspect_round = inspect_round + 1 WHERE lot_id = %s",
                         (lot["lot_id"],))

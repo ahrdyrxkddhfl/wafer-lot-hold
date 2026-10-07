@@ -109,7 +109,11 @@ CREATE TABLE hold_disposition (
     action         text NOT NULL CHECK (action IN ('RELEASE', 'RETEST', 'SCRAP')),
     decided_by     text NOT NULL CHECK (btrim(decided_by) <> ''),  -- I5
     reason         text NOT NULL CHECK (btrim(reason) <> ''),      -- I5
-    decided_at     timestamptz NOT NULL DEFAULT now()
+    -- 사람이 직접 결정한 처분은 NULL. 다른 처분에 딸려 닫힌 처분(폐기·재검사가 같은 Lot의 다른 Hold를 함께 닫음)은
+    -- 원래 처분을 가리킨다. 그 사람이 Hold마다 따로 결정한 것처럼 보이지 않게 구분한다.
+    cascaded_from_disposition_id bigint REFERENCES hold_disposition (disposition_id),
+    decided_at     timestamptz NOT NULL DEFAULT now(),
+    CHECK (cascaded_from_disposition_id <> disposition_id)
 );
 
 -- Lot 이력. 추가만 한다.
