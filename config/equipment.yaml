@@ -21,7 +21,7 @@ model:
 
 data:
   # 01-prep.ipynb 셀 2~3의 값. 바꾸면 기존 split.npz와 달라져 0단계 비교가 실패한다.
-  none_sample_n: 5000   # none 또는 라벨 없음 웨이퍼에서 뽑는 장수. 크면 정상 쪽 비중이 커진다
+  none_sample_n: 5000   # none 또는 라벨 없음 웨이퍼에서 뽑는 장수. 크면 none 또는 라벨 없음 쪽 비중이 커진다
   seed: 42              # sample·train_test_split의 random_state
   test_size: 0.2        # 전체 중 Test 비율
   valid_size: 0.25      # Test를 뺀 나머지 중 Valid 비율(0.25 × 0.8 = 전체의 20%)

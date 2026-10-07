@@ -1,0 +1,23 @@
+# 개발·테스트용 PostgreSQL. 사용자 이름·DB 이름·포트는 config/mes.yaml의 db 값과 같아야 한다.
+# 이미지 버전은 GitHub Actions(.github/workflows/test.yml)와 같게 고정한다.
+services:
+  postgres:
+    image: postgres:17.11
+    container_name: wafer-lot-hold-postgres
+    environment:
+      POSTGRES_USER: mes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env에 POSTGRES_PASSWORD를 설정할 것}
+      POSTGRES_DB: wafer_mes
+    ports:
+      # 호스트 5434 → 컨테이너 5432. 다른 프로젝트가 쓰는 5432·5433과 겹치지 않게 한다.
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mes -d wafer_mes"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
