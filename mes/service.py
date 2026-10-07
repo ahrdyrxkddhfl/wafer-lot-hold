@@ -92,11 +92,41 @@ def _step_seq(cur: psycopg.Cursor, step_code: str) -> int:
     return row["seq"]
 
 
-def _open_hold_id(cur: psycopg.Cursor, lot_id: str) -> int | None:
-    """Lot의 열린 Hold ID. 없으면 None."""
-    cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND closed_at IS NULL", (lot_id,))
+def _open_hold_id(cur: psycopg.Cursor, lot_id: str, rule_name: str | None = None) -> int | None:
+    """Lot의 열린 Hold ID. rule_name을 주면 그 종류만 본다. 없으면 None(여럿이면 가장 먼저 열린 것)."""
+    if rule_name is None:
+        cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND closed_at IS NULL ORDER BY hold_id LIMIT 1",
+                    (lot_id,))
+    else:
+        cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND rule_name = %s AND closed_at IS NULL",
+                    (lot_id, rule_name))
     row = cur.fetchone()
     return None if row is None else row["hold_id"]
+
+
+def _next_step(cur: psycopg.Cursor, step_code: str) -> str | None:
+    """공정 순서에서 다음 공정. 마지막 공정이면 None."""
+    cur.execute("SELECT step_code FROM route_step WHERE seq > %s ORDER BY seq LIMIT 1",
+                (_step_seq(cur, step_code),))
+    row = cur.fetchone()
+    return None if row is None else row["step_code"]
+
+
+def _in_inspect_window(cur: psycopg.Cursor, lot: dict) -> bool:
+    """Lot이 "INSPECT를 시작한 뒤부터 다음 공정에 투입하기 전까지"에 있는지.
+
+    이 기간에만 판정을 받고 재검사(RETEST)를 허용한다. Hold는 완료를 막지 않으므로(I4는 투입만 막음)
+    INSPECT 완료 뒤에도 다음 공정에 들어가기 전이면 이 기간이다.
+    """
+    if lot["status"] in ("SCRAPPED", "FINISHED"):
+        return False
+    cur.execute("SELECT 1 FROM work_order WHERE lot_id = %s AND step_code = %s "
+                "AND status IN ('STARTED', 'COMPLETED')", (lot["lot_id"], INSPECT_STEP))
+    if cur.fetchone() is None:
+        return False
+    if lot["current_step_code"] == INSPECT_STEP:
+        return True
+    return lot["status"] == "WAITING" and lot["current_step_code"] == _next_step(cur, INSPECT_STEP)
 
 
 def _add_history(cur: psycopg.Cursor, lot_id: str, event: str, step_code: str | None = None,
@@ -156,7 +186,7 @@ def set_equipment_status(conn: psycopg.Connection, equipment_id: str, status: st
         reason: 사유.
 
     Returns:
-        DOWN으로 Hold를 열었거나 이미 열려 있던 Hold가 있으면 그 결과, 처리 중인 Lot이 없으면 None.
+        DOWN으로 EQUIPMENT_DOWN Hold를 열었거나 같은 종류가 이미 열려 있으면 그 결과, 처리 중인 Lot이 없으면 None.
 
     Raises:
         RuleViolation: I12에 어긋나거나 입력이 잘못됐을 때.
@@ -226,8 +256,9 @@ def track_in(conn: psycopg.Connection, work_order_id: str, lot_id: str, step_cod
             raise RuleViolation("I10", f"폐기된 Lot: {lot_id}")
         if lot["status"] == "FINISHED":
             raise RuleViolation("I2", f"모든 공정을 마친 Lot: {lot_id}")
-        if _open_hold_id(cur, lot_id) is not None:
-            raise RuleViolation("I4", f"Hold 중인 Lot: {lot_id}")
+        open_hold_id = _open_hold_id(cur, lot_id)
+        if open_hold_id is not None:
+            raise RuleViolation("I4", f"Hold 중인 Lot: {lot_id} (열린 Hold {open_hold_id} 등)")
         if lot["status"] == "IN_PROCESS":
             raise RuleViolation("I7", f"이미 처리 중인 Lot: {lot_id}")
 
@@ -277,8 +308,11 @@ def track_out(conn: psycopg.Connection, work_order_id: str) -> WorkOrderResult:
     Returns:
         작업 지시 결과. 이미 완료된 지시면 already_processed=True.
 
+    열린 Hold가 있어도 완료는 막지 않는다(I4는 다음 공정 투입만 막는다). Hold된 Lot이 설비를 계속
+    차지하면, 사람이 처분할 때까지 그 설비에 다른 Lot을 넣을 수 없기 때문이다.
+
     Raises:
-        RuleViolation: I4, I10 규칙에 어긋나거나 작업 지시가 없을 때.
+        RuleViolation: I10 규칙에 어긋나거나 작업 지시가 없을 때.
     """
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT lot_id FROM work_order WHERE work_order_id = %s", (work_order_id,))
@@ -295,20 +329,16 @@ def track_out(conn: psycopg.Connection, work_order_id: str) -> WorkOrderResult:
             return result
         if lot["status"] == "SCRAPPED":
             raise RuleViolation("I10", f"폐기된 Lot: {lot['lot_id']}")
-        if _open_hold_id(cur, lot["lot_id"]) is not None:
-            raise RuleViolation("I4", f"Hold 중인 Lot: {lot['lot_id']}")
 
         cur.execute("UPDATE work_order SET status = 'COMPLETED', ended_at = now() "
                     "WHERE work_order_id = %s", (work_order_id,))
-        cur.execute("SELECT step_code FROM route_step WHERE seq > %s ORDER BY seq LIMIT 1",
-                    (_step_seq(cur, wo["step_code"]),))
-        nxt = cur.fetchone()
+        nxt = _next_step(cur, wo["step_code"])
         if nxt is None:
             cur.execute("UPDATE lot SET status = 'FINISHED', current_step_code = NULL "
                         "WHERE lot_id = %s", (lot["lot_id"],))
         else:
             cur.execute("UPDATE lot SET status = 'WAITING', current_step_code = %s WHERE lot_id = %s",
-                        (nxt["step_code"], lot["lot_id"]))
+                        (nxt, lot["lot_id"]))
         _add_history(cur, lot["lot_id"], "TRACK_OUT", wo["step_code"], wo["equipment_id"], work_order_id)
     logger.info("완료 %s: %s %s", work_order_id, wo["lot_id"], wo["step_code"])
     return WorkOrderResult(work_order_id, wo["lot_id"], wo["step_code"], wo["equipment_id"],
@@ -318,7 +348,9 @@ def track_out(conn: psycopg.Connection, work_order_id: str) -> WorkOrderResult:
 def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
               trigger_result_id: int | None = None, trigger_equipment_history_id: int | None = None,
               opened_by: str | None = None) -> HoldResult:
-    """Lot에 Hold를 연다. 이미 열린 Hold가 있으면 새로 만들지 않고 그 Hold를 돌려준다(I9).
+    """Lot에 Hold를 연다. 같은 종류(rule_name)의 열린 Hold가 있으면 새로 만들지 않고 그 Hold를 돌려준다(I9).
+
+    종류가 다른 Hold는 함께 열린다. 그래야 설비 고장 Hold 중에 들어온 불량 판정이 묻히지 않는다.
 
     무엇이 열었는지를 정확히 하나만 준다.
         판정 규칙: trigger_result_id(그 판정 결과)
@@ -357,7 +389,7 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
             raise RuleViolation("I10", f"폐기된 Lot: {lot_id}")
         if lot["status"] == "FINISHED":
             raise RuleViolation("INVALID", f"모든 공정을 마친 Lot: {lot_id}")
-        existing = _open_hold_id(cur, lot_id)
+        existing = _open_hold_id(cur, lot_id, rule_name)
         if existing is not None:
             return HoldResult(existing, created=False)
         cur.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, trigger_equipment_history_id, "
@@ -374,8 +406,11 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
                  reason: str) -> DispositionResult:
     """열린 Hold를 처분(해제·재검사·폐기)하고 닫는다.
 
-    RELEASE는 Hold만 닫는다. RETEST는 lot.inspect_round를 1 올린다(작업 지시는 새로 만들지 않음).
-    SCRAP은 Lot을 SCRAPPED(끝 상태)로 두고 처리 중인 작업 지시를 ABORTED로 닫는다.
+    RELEASE는 이 Hold만 닫는다. 다른 종류의 열린 Hold가 남아 있으면 Lot은 계속 투입이 막힌다(I4).
+    RETEST는 이 Hold를 닫고 lot.inspect_round를 1 올린다(작업 지시는 새로 만들지 않음).
+    "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에만 허용한다.
+    SCRAP은 Lot을 SCRAPPED(끝 상태)로 두고, 처리 중인 작업 지시를 ABORTED로, 그 Lot의 다른 열린 Hold도
+    같은 결정자·사유의 SCRAP 처분으로 함께 닫는다(폐기된 Lot에 열린 Hold가 남지 않게).
 
     Args:
         conn: autocommit 연결.
@@ -389,7 +424,7 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
 
     Raises:
         RuleViolation: 결정자·사유가 비었거나(I5), Hold가 없거나, 다른 내용으로 이미 처분됐거나(HOLD_CLOSED),
-            INSPECT 처리 중이 아닌 Lot을 재검사하려 할 때(RETEST_NOT_AT_INSPECT).
+            검사 기간 밖의 Lot을 재검사하려 할 때(RETEST_NOT_AT_INSPECT).
     """
     _require_text(decided_by, "decided_by", "I5")
     _require_text(reason, "reason", "I5")
@@ -410,17 +445,24 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
             if (done["action"], done["decided_by"], done["reason"]) != (action, decided_by, reason):
                 raise RuleViolation("HOLD_CLOSED", f"Hold {hold_id}는 이미 {done['action']}로 처분됨")
             return DispositionResult(done["disposition_id"], already_processed=True)
-        # 재검사는 같은 웨이퍼를 INSPECT에서 다시 판정받는 것이므로, INSPECT 처리 중이 아니면 차수를 올리지 않는다.
-        # 다른 공정에서 차수가 오르면 나중에 받을 첫 판정(1차)이 차수 불일치로 거절된다.
-        if action == "RETEST" and (lot["status"], lot["current_step_code"]) != ("IN_PROCESS", INSPECT_STEP):
+        # 재검사는 같은 웨이퍼를 다시 판정받는 것이므로, 판정을 받는 기간(INSPECT 시작 ~ 다음 공정 투입 전)이
+        # 아니면 차수를 올리지 않는다. 다른 공정에서 차수가 오르면 나중에 받을 첫 판정(1차)이 차수 불일치로 거절된다.
+        if action == "RETEST" and not _in_inspect_window(cur, lot):
             raise RuleViolation("RETEST_NOT_AT_INSPECT",
                                 f"{lot['lot_id']}는 {lot['current_step_code']} {lot['status']}")
 
-        cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason) "
-                    "VALUES (%s, %s, %s, %s) RETURNING disposition_id",
-                    (hold_id, action, decided_by, reason))
-        disposition_id = cur.fetchone()["disposition_id"]
-        cur.execute("UPDATE hold SET closed_at = now() WHERE hold_id = %s", (hold_id,))
+        to_close = [hold_id]
+        if action == "SCRAP":
+            cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND closed_at IS NULL AND hold_id <> %s "
+                        "ORDER BY hold_id", (lot["lot_id"], hold_id))
+            to_close += [r["hold_id"] for r in cur.fetchall()]
+        for h in to_close:
+            cur.execute("INSERT INTO hold_disposition (hold_id, action, decided_by, reason) "
+                        "VALUES (%s, %s, %s, %s) RETURNING disposition_id",
+                        (h, action, decided_by, reason))
+            if h == hold_id:
+                disposition_id = cur.fetchone()["disposition_id"]
+            cur.execute("UPDATE hold SET closed_at = now() WHERE hold_id = %s", (h,))
         if action == "RETEST":
             cur.execute("UPDATE lot SET inspect_round = inspect_round + 1 WHERE lot_id = %s",
                         (lot["lot_id"],))

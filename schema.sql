@@ -92,8 +92,9 @@ CREATE TABLE hold (
     CHECK ((opened_by IS NOT NULL) = (rule_name = 'MANUAL')),
     CHECK ((trigger_equipment_history_id IS NOT NULL) = (rule_name = 'EQUIPMENT_DOWN'))
 );
--- I9: Lot당 열린 Hold는 하나.
-CREATE UNIQUE INDEX hold_one_open_per_lot ON hold (lot_id) WHERE closed_at IS NULL;
+-- I9: 같은 종류(rule_name)의 열린 Hold는 Lot당 하나. 종류가 다르면 함께 열릴 수 있다
+-- (예: 설비 고장 Hold 중에 불량 판정이 오면 규칙 Hold도 따로 열려, 고장 Hold만 해제해도 Lot은 계속 멈춰 있다).
+CREATE UNIQUE INDEX hold_one_open_per_lot_and_rule ON hold (lot_id, rule_name) WHERE closed_at IS NULL;
 
 -- 처분(사람의 결정). Hold 하나에 처분 하나.
 CREATE TABLE hold_disposition (
