@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from skimage.transform import resize
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
 logger = logging.getLogger(__name__)
 
@@ -172,3 +172,31 @@ def split_like_notebook(X: np.ndarray, y: np.ndarray, test_size: float,
             "X_valid": X_valid, "y_valid": y_valid,
             "X_test": X_test, "y_test": y_test,
             "row_train": row_train, "row_valid": row_valid, "row_test": row_test}
+
+
+def split_by_lot(y: np.ndarray, groups: np.ndarray, test_n_splits: int, valid_n_splits: int,
+                 fold_index: int, seed: int) -> dict[str, np.ndarray]:
+    """같은 Lot이 두 분할에 걸치지 않게 나눈다(4단계).
+
+    StratifiedGroupKFold는 그룹(lotName)을 쪼개지 않으면서 각 묶음의 클래스 비율을 전체와 비슷하게 맞춘다.
+    Lot마다 웨이퍼 수와 클래스 구성이 달라 비율이 정확히 맞지는 않는다.
+    전체를 test_n_splits 묶음으로 나눠 fold_index번째를 Test로, 나머지를 valid_n_splits 묶음으로 나눠
+    fold_index번째를 Valid로 쓴다.
+
+    Args:
+        y: 정답 번호.
+        groups: 각 웨이퍼의 lotName.
+        test_n_splits: Test를 고를 때 나눌 묶음 수.
+        valid_n_splits: Valid를 고를 때 나눌 묶음 수.
+        fold_index: 몇 번째 묶음을 쓸지.
+        seed: random_state.
+
+    Returns:
+        축소 데이터 행 번호 row_train, row_valid, row_test.
+    """
+    rows = np.arange(len(y))
+    outer = StratifiedGroupKFold(n_splits=test_n_splits, shuffle=True, random_state=seed)
+    temp, test = list(outer.split(rows, y, groups))[fold_index]
+    inner = StratifiedGroupKFold(n_splits=valid_n_splits, shuffle=True, random_state=seed)
+    train_rel, valid_rel = list(inner.split(temp, y[temp], groups[temp]))[fold_index]
+    return {"row_train": temp[train_rel], "row_valid": temp[valid_rel], "row_test": test}

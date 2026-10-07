@@ -11,3 +11,6 @@ __pycache__/
 .pytest_cache/
 
 .DS_Store
+
+# 4단계 학습 체크포인트 (해시만 기록)
+artifacts/
