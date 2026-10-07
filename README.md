@@ -76,10 +76,14 @@ ORM 없이 SQL을 직접 써서 잠금과 트랜잭션 범위가 코드에 그�
   완료(track_out)로 끝나며, ID는 지시하는 쪽이 정한다.
 - **Lot 상태**는 `WAITING`(현재 공정 대기) → `IN_PROCESS` → 다음 공정 `WAITING` … → `FINISHED`. `SCRAPPED`는 끝 상태다.
   Hold 여부는 Lot 상태에 넣지 않고 열린 Hold 행으로 판단한다.
-- **Hold**는 무엇이 열었는지 남긴다. 규칙이 열었으면 그 판정 결과(`trigger_result_id`), 사람이 열었으면 연 사람(`opened_by`,
-  규칙 이름 `MANUAL`) 중 정확히 하나가 있다.
+- **Hold**는 무엇이 열었는지 남긴다. 판정 규칙이면 그 판정 결과(`trigger_result_id`), 설비 고장이면 그 상태 변경
+  이력(`trigger_equipment_history_id`, 규칙 이름 `EQUIPMENT_DOWN`), 사람이면 연 사람(`opened_by`, 규칙 이름 `MANUAL`)
+  중 정확히 하나가 있다(`CHECK num_nonnulls(...) = 1`).
+- **설비 상태 변경**: 계획 정비(MAINTENANCE)는 처리 중인 Lot이 있으면 거절한다(I12). 고장(DOWN)은 받고, 그 설비에서
+  처리 중인 Lot에 같은 트랜잭션으로 `EQUIPMENT_DOWN` Hold를 연다. 그 Lot은 Hold 때문에 완료가 막힌다(I4).
 - **처분**은 해제(RELEASE), 재검사(RETEST: 검사 차수 `inspect_round` +1), 폐기(SCRAP)이며 결정자와 사유가 필요하다.
-  AI 판정(`inspection_result`)과 사람의 결정(`hold_disposition`)은 다른 테이블에 기록한다.
+  재검사는 Lot이 INSPECT에서 처리 중일 때만 받는다. 이미 처분된 Hold에 같은 내용의 처분이 다시 오면 기존 처분을
+  돌려주고, 다른 내용이면 거절한다. AI 판정(`inspection_result`)과 사람의 결정(`hold_disposition`)은 다른 테이블에 기록한다.
 - 시각은 모두 DB가 찍는다(`timestamptz DEFAULT now()`).
 
 ### 막는 상태
@@ -92,15 +96,20 @@ ORM 없이 SQL을 직접 써서 잠금과 트랜잭션 범위가 코드에 그�
 | I4 | Hold된 Lot 진행 | 열린 Hold가 있으면 투입·완료 거절 | — |
 | I5 | 사유·결정자 없는 처분 | 빈 값·공백 거절 | `NOT NULL` + `CHECK (btrim(...) <> '')` |
 | I6 | 정지·정비 중인 설비에 투입 | 설비가 `AVAILABLE`이 아니면 거절 | 상태 값 `CHECK` |
-| I7 | 두 설비가 같은 Lot을 동시에 처리 | Lot 행 `SELECT ... FOR UPDATE` 후 처리 중이면 거절 | 부분 유일 인덱스 `(lot_id) WHERE status='STARTED'` |
+| I7 | 두 설비가 같은 Lot을 동시에 처리 | Lot 행 `SELECT ... FOR NO KEY UPDATE` 후 처리 중이면 거절 | 부분 유일 인덱스 `(lot_id) WHERE status='STARTED'` |
 | I8 | 같은 판정 결과를 다시 보냄 | (2단계) | `UNIQUE (wafer_id, model_sha256, inspect_round)` |
 | I9 | 한 Lot에 열린 Hold가 두 개 | 열린 Hold가 있으면 새로 만들지 않고 그 Hold 반환 | 부분 유일 인덱스 `(lot_id) WHERE closed_at IS NULL` |
 | I10 | 폐기된 Lot 진행 | `SCRAPPED`면 투입·완료·Hold 거절 | — |
-| I11 | 한 설비가 두 Lot을 동시에 처리 | 설비 행 `SELECT ... FOR UPDATE` 후 처리 중인 Lot이 있으면 거절 | 부분 유일 인덱스 `(equipment_id) WHERE status='STARTED'` |
+| I11 | 한 설비가 두 Lot을 동시에 처리 | 설비 행 `SELECT ... FOR NO KEY UPDATE` 후 처리 중인 Lot이 있으면 거절 | 부분 유일 인덱스 `(equipment_id) WHERE status='STARTED'` |
+| I12 | 처리 중인 설비를 계획 정비로 변경 | 그 설비에 처리 중인 Lot이 있으면 거절 (고장은 받고 그 Lot에 Hold) | — |
 
 잠금이 정상 경로이고 제약은 마지막 방어선이다. 잠금이 제대로 걸리면 제약 위반은 일어날 수 없으므로,
 제약 위반은 규칙 오류로 바꾸지 않고 그대로 실패시킨다. 규칙마다 테스트가 [tests/test_rules.py](tests/test_rules.py)에 있고,
 I7·I11은 연결 두 개를 배리어로 같은 순간에 출발시켜 하나만 성공하는지 확인한다.
+
+- I7 잠금을 뺀 실험에서는 같은 공정 중복을 막는 I2 제약(`UNIQUE (lot_id, step_code)`)이 먼저 막았다.
+- 외래키 확인이 참조 행에 거는 잠금 때문에 생긴 교착을 동시성 테스트로 찾아 행 잠금 방식을 바꿨다
+  (`FOR UPDATE` → `FOR NO KEY UPDATE`, 경위는 [docs/decisions.md](docs/decisions.md)).
 
 ### 테스트 실행
 
