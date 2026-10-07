@@ -10,10 +10,12 @@ Lot을 바꾸는 동작은 먼저 lot 행을 잠근다. 같은 Lot에 대한 요
 `FOR NO KEY UPDATE`끼리는 충돌하므로 같은 Lot·같은 설비를 동시에 바꾸지 못하는 직렬화는 그대로다.
 """
 import logging
+import re
 from dataclasses import dataclass
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from mes.errors import RuleViolation
 
@@ -25,6 +27,7 @@ MANUAL_RULE = "MANUAL"
 EQUIPMENT_DOWN_RULE = "EQUIPMENT_DOWN"
 # 검사 판정을 받는 공정. config/mes.yaml의 route에 반드시 있어야 한다(seed_master_data가 확인).
 INSPECT_STEP = "INSPECT"
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,44 @@ class HoldResult:
     """Hold 열기 결과. 이미 열린 Hold가 있으면 created=False로 그 Hold를 돌려준다."""
     hold_id: int
     created: bool
+
+
+@dataclass(frozen=True)
+class StopRule:
+    """정지 규칙. 같은 Lot·같은 차수에서 정지 대상 판정을 받은 서로 다른 웨이퍼가 min_count장 이상이면 멈춘다."""
+    name: str
+    defect_types: tuple[str, ...]
+    min_prob: float
+    min_count: int
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "StopRule":
+        """config/mes.yaml의 stop_rule 항목으로 만든다."""
+        rule = cls(cfg["name"], tuple(cfg["defect_types"]), float(cfg["min_prob"]), int(cfg["min_count"]))
+        if rule.name in (MANUAL_RULE, EQUIPMENT_DOWN_RULE) or not rule.defect_types or rule.min_count < 1:
+            raise ValueError(f"잘못된 정지 규칙 설정: {cfg}")
+        return rule
+
+    def params(self) -> dict:
+        """Hold에 남길 기준값 스냅샷."""
+        return {"defect_types": list(self.defect_types), "min_prob": self.min_prob, "min_count": self.min_count}
+
+
+@dataclass(frozen=True)
+class ResultIn:
+    """웨이퍼 하나의 검사 판정."""
+    wafer_id: str
+    pred_label: str
+    probabilities: dict[str, float]
+
+
+@dataclass(frozen=True)
+class ReceiveResult:
+    """판정 배치 수신 결과. 같은 내용의 재전송은 duplicates로 센다(I8)."""
+    received: int
+    inserted: int
+    duplicates: int
+    hold: HoldResult | None
 
 
 def _require_text(value: str | None, field: str, rule: str) -> str:
@@ -237,7 +278,7 @@ def track_in(conn: psycopg.Connection, work_order_id: str, lot_id: str, step_cod
         작업 지시 결과. 같은 ID·같은 내용의 요청이 이미 처리됐으면 already_processed=True.
 
     Raises:
-        RuleViolation: I1~I4, I6, I7, I10, I11 규칙에 어긋날 때.
+        RuleViolation: I1~I4, I6, I7, I10, I11, I13 규칙에 어긋날 때.
     """
     _require_text(work_order_id, "work_order_id", "INVALID")
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
@@ -269,6 +310,15 @@ def track_in(conn: psycopg.Connection, work_order_id: str, lot_id: str, step_cod
             raise RuleViolation("I2", f"{lot_id}는 {step_code}를 이미 처리함")
         if step_code != lot["current_step_code"]:
             raise RuleViolation("I1", f"{lot_id}의 다음 공정은 {lot['current_step_code']} (요청 {step_code})")
+        if step_code == _next_step(cur, INSPECT_STEP):
+            # I13: 검사 다음 공정에 들어가려면 모든 웨이퍼에 현재 차수 판정이 1건 이상 있어야 한다.
+            # Lot 잠금 안에서 세므로, 세는 동안 같은 Lot에 판정이 들어와 숫자가 바뀌지 않는다.
+            cur.execute("SELECT count(*) AS n FROM wafer w WHERE w.lot_id = %s AND NOT EXISTS ("
+                        "SELECT 1 FROM inspection_result r WHERE r.wafer_id = w.wafer_id AND r.inspect_round = %s)",
+                        (lot_id, lot["inspect_round"]))
+            n_missing = cur.fetchone()["n"]
+            if n_missing:
+                raise RuleViolation("I13", f"{lot_id}의 웨이퍼 {n_missing}장에 {lot['inspect_round']}차 판정이 없음")
 
         # 교착 방지 전제: Lot을 잡은 채 설비 잠금을 기다리는 것은 "이 공정의 설비에 처음 투입하는" 요청뿐이어야 한다.
         # 그래야 설비 DOWN 처리(설비 → 그 설비에서 처리 중인 Lot 순서로 잠금)와 서로 기다리지 않는다.
@@ -347,13 +397,13 @@ def track_out(conn: psycopg.Connection, work_order_id: str) -> WorkOrderResult:
 
 def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
               trigger_result_id: int | None = None, trigger_equipment_history_id: int | None = None,
-              opened_by: str | None = None) -> HoldResult:
+              opened_by: str | None = None, rule_params: dict | None = None) -> HoldResult:
     """Lot에 Hold를 연다. 같은 종류(rule_name)의 열린 Hold가 있으면 새로 만들지 않고 그 Hold를 돌려준다(I9).
 
     종류가 다른 Hold는 함께 열린다. 그래야 설비 고장 Hold 중에 들어온 불량 판정이 묻히지 않는다.
 
     무엇이 열었는지를 정확히 하나만 준다.
-        판정 규칙: trigger_result_id(그 판정 결과)
+        판정 규칙: trigger_result_id(그 판정 결과)와 rule_params(그때 적용한 기준값)
         설비 고장: trigger_equipment_history_id(그 상태 변경 이력), rule_name='EQUIPMENT_DOWN'
         사람: opened_by, rule_name='MANUAL'
 
@@ -364,6 +414,7 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
         trigger_result_id: Hold를 열게 한 inspection_result ID.
         trigger_equipment_history_id: Hold를 열게 한 equipment_status_history ID.
         opened_by: Hold를 연 사람.
+        rule_params: 판정 규칙이 연 Hold의 기준값 스냅샷. trigger_result_id와 함께만 준다.
 
     Returns:
         Hold ID와 새로 만들었는지 여부.
@@ -382,6 +433,8 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
         raise RuleViolation("INVALID", f"사람이 연 Hold만 rule_name이 {MANUAL_RULE}")
     if (trigger_equipment_history_id is not None) != (rule_name == EQUIPMENT_DOWN_RULE):
         raise RuleViolation("INVALID", f"설비 고장으로 연 Hold만 rule_name이 {EQUIPMENT_DOWN_RULE}")
+    if (trigger_result_id is not None) != (rule_params is not None):
+        raise RuleViolation("INVALID", "판정 규칙이 연 Hold만 rule_params가 있음")
 
     with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
         lot = _lock_lot(cur, lot_id)
@@ -393,9 +446,9 @@ def open_hold(conn: psycopg.Connection, lot_id: str, rule_name: str, *,
         if existing is not None:
             return HoldResult(existing, created=False)
         cur.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, trigger_equipment_history_id, "
-                    "opened_by, inspect_round) VALUES (%s, %s, %s, %s, %s, %s) RETURNING hold_id",
+                    "opened_by, rule_params, inspect_round) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING hold_id",
                     (lot_id, rule_name, trigger_result_id, trigger_equipment_history_id, opened_by,
-                     lot["inspect_round"]))
+                     None if rule_params is None else Jsonb(rule_params), lot["inspect_round"]))
         hold_id = cur.fetchone()["hold_id"]
         _add_history(cur, lot_id, "HOLD", step_code=lot["current_step_code"], hold_id=hold_id)
     logger.info("Hold %d 열림: %s (%s)", hold_id, lot_id, rule_name)
@@ -473,3 +526,124 @@ def dispose_hold(conn: psycopg.Connection, hold_id: int, action: str, decided_by
         _add_history(cur, lot["lot_id"], action, step_code=lot["current_step_code"], hold_id=hold_id)
     logger.info("Hold %d 처분 %s by %s", hold_id, action, decided_by)
     return DispositionResult(disposition_id, already_processed=False)
+
+
+def _validate_results(results: list[ResultIn], labels: list[str], model_sha256: str) -> None:
+    """판정 배치의 형식을 DB에 가기 전에 확인한다. 하나라도 틀리면 배치 전체를 거절한다."""
+    if not results:
+        raise RuleViolation("INVALID", "판정이 비어 있음")
+    if not SHA256_PATTERN.fullmatch(model_sha256):
+        raise RuleViolation("INVALID", f"모델 해시 형식이 아님: {model_sha256}")
+    wafer_ids = [r.wafer_id for r in results]
+    if len(set(wafer_ids)) != len(wafer_ids):
+        raise RuleViolation("INVALID", "한 배치에 같은 웨이퍼가 두 번 있음")
+    for r in results:
+        if r.pred_label not in labels:
+            raise RuleViolation("INVALID", f"{r.wafer_id}: 약속에 없는 판정 유형 {r.pred_label}")
+        if set(r.probabilities) != set(labels):
+            raise RuleViolation("INVALID", f"{r.wafer_id}: 확률의 유형 목록이 약속과 다름")
+        if any(not 0.0 <= v <= 1.0 for v in r.probabilities.values()):
+            raise RuleViolation("INVALID", f"{r.wafer_id}: 0~1 밖의 확률")
+
+
+def _apply_stop_rule(conn: psycopg.Connection, cur: psycopg.Cursor, lot_id: str, work_order_id: str,
+                     inspect_round: int, rule: StopRule) -> HoldResult | None:
+    """같은 작업 지시·같은 차수의 판정을 모두 세어 기준을 넘으면 규칙 Hold를 연다(Lot 잠금 안에서 부른다).
+
+    장수는 판정 건수가 아니라 서로 다른 웨이퍼 수로 센다. 같은 웨이퍼를 모델 두 개가 판정하면 판정이 두 건이기 때문이다.
+    Hold를 연 판정(trigger_result_id)은 서로 다른 웨이퍼 수가 min_count에 처음 도달하게 만든 판정이다.
+    같은 Lot·같은 차수에 규칙 Hold가 이미 있으면(열림·닫힘 무관) 다시 열지 않는다.
+    """
+    hit = ("FROM inspection_result WHERE work_order_id = %s AND inspect_round = %s "
+           "AND pred_label = ANY(%s) AND (probabilities ->> pred_label)::float8 >= %s")
+    params = (work_order_id, inspect_round, list(rule.defect_types), rule.min_prob)
+    cur.execute("SELECT count(DISTINCT wafer_id) AS n " + hit, params)
+    if cur.fetchone()["n"] < rule.min_count:
+        return None
+
+    cur.execute("SELECT result_id, wafer_id " + hit + " ORDER BY result_id", params)
+    seen: set[str] = set()
+    trigger = None
+    for row in cur.fetchall():
+        seen.add(row["wafer_id"])
+        if len(seen) == rule.min_count:
+            trigger = row["result_id"]
+            break
+
+    cur.execute("SELECT hold_id FROM hold WHERE lot_id = %s AND inspect_round = %s AND trigger_result_id IS NOT NULL",
+                (lot_id, inspect_round))
+    existing = cur.fetchone()
+    if existing is not None:
+        return HoldResult(existing["hold_id"], created=False)
+    return open_hold(conn, lot_id, rule.name, trigger_result_id=trigger, rule_params=rule.params())
+
+
+def receive_inspection_results(conn: psycopg.Connection, lot_id: str, work_order_id: str, inspect_round: int,
+                               model_sha256: str, results: list[ResultIn], labels: list[str],
+                               rule: StopRule) -> ReceiveResult:
+    """Lot 하나의 한 차수 검사 판정 배치를 받아 기록하고, 정지 규칙을 적용한다(한 트랜잭션).
+
+    배치 안의 판정이 하나라도 잘못되면 배치 전체를 거절한다. 같은 (웨이퍼, 모델 해시, 차수)의 판정이
+    이미 있으면 내용(판정 유형·확률)이 같을 때만 중복으로 세고, 다르면 배치 전체를 거절한다(I8).
+    판정은 "INSPECT를 시작한 뒤부터 다음 공정 투입 전까지"에, 현재 차수(lot.inspect_round)로만 받는다.
+
+    Args:
+        conn: autocommit 연결.
+        lot_id: Lot ID.
+        work_order_id: 그 Lot의 INSPECT 작업 지시.
+        inspect_round: 검사 차수.
+        model_sha256: 판정한 모델의 체크포인트 SHA-256.
+        results: 웨이퍼별 판정.
+        labels: 받을 수 있는 판정 유형(config labels).
+        rule: 정지 규칙.
+
+    Returns:
+        받은 수, 새로 기록한 수, 중복 수, 규칙 Hold(없으면 None).
+
+    Raises:
+        RuleViolation: 형식 오류(INVALID), 없는 Lot·작업 지시·웨이퍼(NOT_FOUND), 받는 기간 밖(RESULT_NOT_ACCEPTED),
+            차수 불일치(ROUND_MISMATCH), 같은 키에 다른 내용(I8).
+    """
+    _validate_results(results, labels, model_sha256)
+    with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+        # 같은 Lot에 판정이 동시에 들어와도 한 번에 하나씩 기록하고 세게 Lot을 먼저 잠근다.
+        lot = _lock_lot(cur, lot_id)
+        cur.execute("SELECT lot_id, step_code FROM work_order WHERE work_order_id = %s", (work_order_id,))
+        wo = cur.fetchone()
+        if wo is None:
+            raise RuleViolation("NOT_FOUND", f"작업 지시 없음: {work_order_id}")
+        if (wo["lot_id"], wo["step_code"]) != (lot_id, INSPECT_STEP):
+            raise RuleViolation("RESULT_NOT_ACCEPTED", f"{work_order_id}는 {lot_id}의 {INSPECT_STEP} 작업 지시가 아님")
+        if not _in_inspect_window(cur, lot):
+            raise RuleViolation("RESULT_NOT_ACCEPTED",
+                                f"{lot_id}는 판정을 받는 기간이 아님({lot['current_step_code']} {lot['status']})")
+        if inspect_round != lot["inspect_round"]:
+            raise RuleViolation("ROUND_MISMATCH", f"{lot_id}의 현재 차수는 {lot['inspect_round']} (요청 {inspect_round})")
+
+        wafer_ids = [r.wafer_id for r in results]
+        cur.execute("SELECT wafer_id FROM wafer WHERE lot_id = %s AND wafer_id = ANY(%s)", (lot_id, wafer_ids))
+        missing = set(wafer_ids) - {r["wafer_id"] for r in cur.fetchall()}
+        if missing:
+            raise RuleViolation("NOT_FOUND", f"{lot_id}에 없는 웨이퍼: {sorted(missing)[:5]}")
+
+        cur.execute("SELECT wafer_id, pred_label, probabilities FROM inspection_result "
+                    "WHERE wafer_id = ANY(%s) AND model_sha256 = %s AND inspect_round = %s",
+                    (wafer_ids, model_sha256, inspect_round))
+        existing = {r["wafer_id"]: r for r in cur.fetchall()}
+        new = []
+        for r in results:
+            old = existing.get(r.wafer_id)
+            if old is None:
+                new.append(r)
+            elif (old["pred_label"], old["probabilities"]) != (r.pred_label, r.probabilities):
+                raise RuleViolation("I8", f"{r.wafer_id}의 {inspect_round}차 판정이 다른 내용으로 이미 있음")
+        for r in new:
+            cur.execute("INSERT INTO inspection_result "
+                        "(wafer_id, work_order_id, inspect_round, model_sha256, pred_label, probabilities) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (r.wafer_id, work_order_id, inspect_round, model_sha256, r.pred_label,
+                         Jsonb(r.probabilities)))
+        hold = _apply_stop_rule(conn, cur, lot_id, work_order_id, inspect_round, rule)
+    logger.info("판정 수신 %s %d차: %d건 중 새 기록 %d, 중복 %d, Hold %s", lot_id, inspect_round, len(results),
+                len(new), len(results) - len(new), hold)
+    return ReceiveResult(len(results), len(new), len(results) - len(new), hold)

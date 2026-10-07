@@ -74,6 +74,8 @@ CREATE TABLE inspection_result (
     received_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (wafer_id, model_sha256, inspect_round)  -- I8
 );
+-- 정지 규칙: 같은 작업 지시(=Lot의 INSPECT)·같은 차수의 판정을 센다.
+CREATE INDEX inspection_result_work_order_round ON inspection_result (work_order_id, inspect_round);
 
 -- Hold(정지). 무엇이 열었는지 정확히 하나가 있다.
 --   판정 규칙: trigger_result_id / 설비 고장: trigger_equipment_history_id (rule_name 'EQUIPMENT_DOWN')
@@ -85,16 +87,20 @@ CREATE TABLE hold (
     trigger_result_id            bigint REFERENCES inspection_result (result_id),
     trigger_equipment_history_id bigint REFERENCES equipment_status_history (history_id),
     opened_by                    text CHECK (btrim(opened_by) <> ''),
+    rule_params                  jsonb,  -- 규칙이 연 Hold의 기준값 스냅샷(유형 집합·확률 하한·최소 장수)
     inspect_round                int  NOT NULL CHECK (inspect_round >= 1),
     opened_at                    timestamptz NOT NULL DEFAULT now(),
     closed_at                    timestamptz,  -- 처분과 같은 트랜잭션에서 채운다
     CHECK (num_nonnulls(trigger_result_id, trigger_equipment_history_id, opened_by) = 1),
     CHECK ((opened_by IS NOT NULL) = (rule_name = 'MANUAL')),
-    CHECK ((trigger_equipment_history_id IS NOT NULL) = (rule_name = 'EQUIPMENT_DOWN'))
+    CHECK ((trigger_equipment_history_id IS NOT NULL) = (rule_name = 'EQUIPMENT_DOWN')),
+    CHECK ((trigger_result_id IS NOT NULL) = (rule_params IS NOT NULL))
 );
 -- I9: 같은 종류(rule_name)의 열린 Hold는 Lot당 하나. 종류가 다르면 함께 열릴 수 있다
 -- (예: 설비 고장 Hold 중에 불량 판정이 오면 규칙 Hold도 따로 열려, 고장 Hold만 해제해도 Lot은 계속 멈춰 있다).
 CREATE UNIQUE INDEX hold_one_open_per_lot_and_rule ON hold (lot_id, rule_name) WHERE closed_at IS NULL;
+-- 같은 Lot·같은 검사 차수에서 판정 규칙 Hold는 한 번만 연다(해제 후 같은 판정을 다시 보내도 다시 열리지 않게).
+CREATE UNIQUE INDEX hold_one_rule_hold_per_round ON hold (lot_id, inspect_round) WHERE trigger_result_id IS NOT NULL;
 
 -- 처분(사람의 결정). Hold 하나에 처분 하나.
 CREATE TABLE hold_disposition (

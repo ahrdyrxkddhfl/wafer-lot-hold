@@ -27,3 +27,22 @@ equipment:
   STEP_2: [S2-EQ-01, S2-EQ-02]
   INSPECT: [IN-EQ-01, IN-EQ-02]
   SHIP: [SH-ST-01]
+
+# 판정 유형으로 받을 수 있는 값(검사 장비와의 약속). 판정의 pred_label과 probabilities의 키는 이 목록과 같아야 한다.
+labels: [Center, Donut, Edge-Loc, Edge-Ring, Loc, Near-full, Random, Scratch, none]
+
+# 정지 규칙. 같은 Lot·같은 검사 차수에서, defect_types로 판정되고 그 판정 확률이 min_prob 이상인 웨이퍼가
+# min_count장 이상이면 Lot을 멈춘다(Hold). 값은 검증용 Lot의 후보 비교로 정했다(docs/decisions.md).
+# 규칙이 연 Hold에는 그때 쓴 값이 rule_params로 남으므로, 값을 바꿔도 예전 Hold의 기준을 알 수 있다.
+stop_rule:
+  name: DEFECT_TYPE_IN_LOT
+  # 정지 대상 유형. 줄이면 덜 멈추지만 뺀 유형의 불량은 놓친다
+  defect_types: [Center, Donut, Edge-Loc, Edge-Ring, Loc, Near-full, Random, Scratch]
+  # 판정 확률 하한. 이보다 낮은 확률의 판정은 세지 않는다. 크면 덜 멈추고 놓침이 는다
+  min_prob: 0.0
+  # Lot당 최소 장수(서로 다른 웨이퍼 수). 크면 한두 장의 오판정으로는 멈추지 않지만 불량 웨이퍼가 적은 Lot을 놓친다
+  min_count: 1
+
+api:
+  # 판정 수신 요청 하나에 담을 수 있는 판정 수. 배치 하나는 Lot 하나의 한 차수(최대 25장)라 그보다 크게 둔다
+  max_results_per_request: 50

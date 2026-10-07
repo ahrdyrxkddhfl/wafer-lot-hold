@@ -1,4 +1,5 @@
-"""막아야 할 상태(I1~I7, I9~I11)와 정상 흐름 테스트. 실제 PostgreSQL 테스트 DB에 대해 돈다."""
+"""막아야 할 상태(I1~I13), 판정 수신·정지 규칙, 정상 흐름 테스트. 실제 PostgreSQL 테스트 DB에 대해 돈다."""
+import dataclasses
 import threading
 import time
 from collections.abc import Callable
@@ -8,7 +9,8 @@ import pytest
 
 from mes import service
 from mes.errors import RuleViolation
-from mes.service import create_lot, dispose_hold, open_hold, set_equipment_status, track_in, track_out
+from mes.service import (ResultIn, StopRule, create_lot, dispose_hold, open_hold, receive_inspection_results,
+                         set_equipment_status, track_in, track_out)
 
 # 잠금이 없을 때 두 요청이 모두 검사를 통과하도록, 행을 읽은 직후 기다리는 시간.
 # 잠금이 있으면 두 번째 요청은 이 시간 동안 잠금에서 기다린다. 너무 짧으면 경쟁이 재현되지 않을 수 있다.
@@ -16,6 +18,11 @@ RACE_WINDOW_SECONDS = 0.3
 THREAD_TIMEOUT_SECONDS = 10
 # 잠금을 기다리면 안 되는 요청에 거는 대기 한도. 넘으면 LockNotAvailable로 실패해 "기다렸다"는 것이 드러난다.
 LOCK_TIMEOUT_MS = 500
+# 동시성 테스트에서 순서를 강제할 때 나중에 출발할 쪽의 출발 지연. RACE_WINDOW_SECONDS보다 작아야
+# 먼저 출발한 쪽이 잠금을 쥐고 기다리는 동안 나중 쪽이 도착해 실제로 잠금을 기다리게 된다.
+START_DELAY_SECONDS = 0.1
+MODEL_A = "a" * 64  # 테스트용 모델 해시
+MODEL_B = "b" * 64
 
 
 @pytest.fixture
@@ -28,8 +35,31 @@ def eqs(mes_cfg: dict) -> dict[str, list[str]]:
     return mes_cfg["equipment"]
 
 
+@pytest.fixture
+def labels(mes_cfg: dict) -> list[str]:
+    return mes_cfg["labels"]
+
+
+@pytest.fixture
+def rule(mes_cfg: dict) -> StopRule:
+    return StopRule.from_config(mes_cfg["stop_rule"])
+
+
 def make_lot(conn: psycopg.Connection, lot_id: str, n_wafers: int = 2) -> None:
     create_lot(conn, lot_id, [(f"{lot_id}_W{i:02d}", i) for i in range(1, n_wafers + 1)])
+
+
+def judged(wafer_id: str, label: str, labels: list[str]) -> ResultIn:
+    """판정 유형의 확률이 1.0인 판정."""
+    return ResultIn(wafer_id, label, {c: (1.0 if c == label else 0.0) for c in labels})
+
+
+def send(conn: psycopg.Connection, lot_id: str, label_by_wafer: dict[str, str], labels: list[str],
+         rule: StopRule, inspect_round: int = 1, model: str = MODEL_A, wo_id: str | None = None):
+    """Lot의 INSPECT 작업 지시(기본 ID {lot_id}-INSPECT)로 판정 배치를 보낸다."""
+    return receive_inspection_results(
+        conn, lot_id, wo_id or f"{lot_id}-{service.INSPECT_STEP}", inspect_round, model,
+        [judged(w, lab, labels) for w, lab in label_by_wafer.items()], labels, rule)
 
 
 def count(conn: psycopg.Connection, query: str, params: tuple = ()) -> int:
@@ -55,14 +85,20 @@ def slow_after(original: Callable) -> Callable:
 
 
 def run_at_same_time(connect_test: Callable[[], psycopg.Connection],
-                     calls: list[Callable[[psycopg.Connection], object]]) -> list[tuple[str, object]]:
-    """각 호출을 스레드·연결 하나씩에서 배리어로 동시에 출발시키고 (결과 종류, 값) 목록을 돌려준다."""
+                     calls: list[Callable[[psycopg.Connection], object]],
+                     start_delays: list[float] | None = None) -> list[tuple[str, object]]:
+    """각 호출을 스레드·연결 하나씩에서 배리어로 동시에 출발시키고 (결과 종류, 값) 목록을 돌려준다.
+
+    start_delays를 주면 배리어 뒤에 그만큼 늦게 출발해, 어느 쪽이 먼저 잠금을 잡을지 정할 수 있다.
+    """
     barrier = threading.Barrier(len(calls))
     outcomes: list[tuple[str, object]] = [("not_run", None)] * len(calls)
+    delays = start_delays or [0.0] * len(calls)
 
     def worker(i: int, call: Callable[[psycopg.Connection], object]) -> None:
         with connect_test() as c:
             barrier.wait()
+            time.sleep(delays[i])
             try:
                 outcomes[i] = ("ok", call(c))
             except Exception as e:  # 결과로 기록해 테스트에서 종류를 확인한다
@@ -79,10 +115,12 @@ def run_at_same_time(connect_test: Callable[[], psycopg.Connection],
 
 # ── 정상 흐름 ──────────────────────────────────────────────
 
-def test_lot_goes_through_all_steps_to_finished(conn, route, eqs):
+def test_lot_goes_through_all_steps_to_finished(conn, route, eqs, labels, rule):
     make_lot(conn, "LOT_A")
     for i, step in enumerate(route):
         track_in(conn, f"WO-{i}", "LOT_A", step, eqs[step][0])
+        if step == service.INSPECT_STEP:  # 다음 공정에 들어가려면 모든 웨이퍼의 판정이 있어야 한다(I13)
+            send(conn, "LOT_A", {"LOT_A_W01": "none", "LOT_A_W02": "none"}, labels, rule, wo_id=f"WO-{i}")
         track_out(conn, f"WO-{i}")
 
     assert lot_row(conn, "LOT_A")[:2] == ("FINISHED", None)
@@ -483,49 +521,50 @@ def no_deadlock(outcomes: list[tuple[str, object]]) -> None:
         assert not isinstance(value, psycopg.errors.DeadlockDetected), outcomes
 
 
-def test_down_and_track_in_to_same_equipment_do_not_deadlock(conn, connect_test, monkeypatch, route, eqs):
+@pytest.mark.parametrize("first", ["track_in", "down"])
+def test_down_and_track_in_to_same_equipment_in_both_orders(conn, connect_test, monkeypatch, route, eqs, first):
+    """먼저 출발한 쪽이 설비를 잡고 RACE_WINDOW 동안 쥐고 있는 사이에 나중 쪽이 도착해 기다린다."""
     eq1 = eqs[route[0]][0]
     make_lot(conn, "LOT_B")
-    monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
     monkeypatch.setattr(service, "_lock_equipment", slow_after(service._lock_equipment))
 
     outcomes = run_at_same_time(connect_test, [
         lambda c: track_in(c, "WO-B", "LOT_B", route[0], eq1),
         lambda c: set_equipment_status(c, eq1, "DOWN", "engineer", "고장"),
-    ])
+    ], start_delays=[0.0, START_DELAY_SECONDS] if first == "track_in" else [START_DELAY_SECONDS, 0.0])
 
     no_deadlock(outcomes)
     (in_kind, in_value), (down_kind, _) = outcomes
     assert down_kind == "ok", outcomes
     open_down_holds = count(conn, "SELECT count(*) FROM hold WHERE lot_id = 'LOT_B' "
                                   "AND rule_name = 'EQUIPMENT_DOWN' AND closed_at IS NULL")
-    if in_kind == "ok":   # 투입이 먼저: 고장 처리가 그 Lot에 Hold를 연다
-        assert open_down_holds == 1
-    else:                 # 고장이 먼저: 투입이 I6으로 거절된다
+    if first == "track_in":  # 투입이 먼저: 고장 처리가 그 Lot에 Hold를 연다
+        assert in_kind == "ok" and open_down_holds == 1, outcomes
+    else:                    # 고장이 먼저: 투입이 I6으로 거절된다
         assert isinstance(in_value, RuleViolation) and in_value.rule == "I6", outcomes
         assert open_down_holds == 0 and count(conn, "SELECT count(*) FROM work_order") == 0
 
 
-def test_down_and_track_out_on_same_equipment_do_not_deadlock(conn, connect_test, monkeypatch, route, eqs):
+@pytest.mark.parametrize("first", ["track_out", "down"])
+def test_down_and_track_out_on_same_equipment_in_both_orders(conn, connect_test, monkeypatch, route, eqs, first):
+    """고장 처리는 설비 → Lot, 완료는 Lot만 잠근다. 어느 쪽이 Lot을 먼저 잡아도 교착 없이 끝나야 한다."""
     eq1 = eqs[route[0]][0]
     make_lot(conn, "LOT_A")
     track_in(conn, "WO-A", "LOT_A", route[0], eq1)
     monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
-    monkeypatch.setattr(service, "_lock_equipment", slow_after(service._lock_equipment))
 
     outcomes = run_at_same_time(connect_test, [
         lambda c: track_out(c, "WO-A"),
         lambda c: set_equipment_status(c, eq1, "DOWN", "engineer", "고장"),
-    ])
+    ], start_delays=[0.0, START_DELAY_SECONDS] if first == "track_out" else [START_DELAY_SECONDS, 0.0])
 
     no_deadlock(outcomes)
     (out_kind, _), (down_kind, _) = outcomes
-    assert down_kind == "ok", outcomes
-    # 완료는 Hold와 상관없이 항상 성공한다. 고장 처리가 먼저면 Hold가 열리고, 완료가 먼저면
-    # 고장 처리는 Lot을 잠근 뒤 다시 확인해 Hold를 열지 않는다.
-    assert out_kind == "ok", outcomes
+    assert out_kind == "ok" and down_kind == "ok", outcomes  # 완료는 Hold와 상관없이 성공한다
     assert lot_row(conn, "LOT_A")[:2] == ("WAITING", route[1])
-    assert count(conn, "SELECT count(*) FROM hold WHERE lot_id = 'LOT_A' AND closed_at IS NULL") in (0, 1)
+    open_holds = count(conn, "SELECT count(*) FROM hold WHERE lot_id = 'LOT_A' AND closed_at IS NULL")
+    # 완료가 먼저면 고장 처리는 Lot을 잠근 뒤 다시 확인해 Hold를 열지 않고, 고장이 먼저면 Hold가 열린다.
+    assert open_holds == (0 if first == "track_out" else 1)
 
 
 # ── 처분 RETEST ─────────────────────────────────────────────
@@ -582,3 +621,261 @@ def test_scrap_closes_all_open_holds_of_lot(conn, route, eqs):
     assert count(conn, "SELECT count(*) FROM hold WHERE closed_at IS NULL") == 0
     assert conn.execute("SELECT action, decided_by, reason FROM hold_disposition ORDER BY disposition_id"
                         ).fetchall() == [("SCRAP", "engineer", "불량 확정")] * 2
+
+
+# ── 2단계: 판정 수신과 정지 규칙 ─────────────────────────────────
+
+def lot_at_inspect(conn: psycopg.Connection, lot_id: str, route: list[str], eqs: dict[str, list[str]],
+                   n_wafers: int = 2) -> str:
+    make_lot(conn, lot_id, n_wafers)
+    return track_in_to_inspect(conn, lot_id, route, eqs)
+
+
+def wafers(lot_id: str, label: str, n: int = 2) -> dict[str, str]:
+    return {f"{lot_id}_W{i:02d}": label for i in range(1, n + 1)}
+
+
+def result_id(conn: psycopg.Connection, wafer_id: str, model: str = MODEL_A, inspect_round: int = 1) -> int:
+    return conn.execute("SELECT result_id FROM inspection_result WHERE wafer_id = %s AND model_sha256 = %s "
+                        "AND inspect_round = %s", (wafer_id, model, inspect_round)).fetchone()[0]
+
+
+def test_results_without_defect_open_no_hold(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    r = send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    assert (r.received, r.inserted, r.duplicates, r.hold) == (2, 2, 0, None)
+
+
+def test_defect_result_opens_rule_hold_with_trigger_and_params(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    r = send(conn, "LOT_A", {"LOT_A_W01": "none", "LOT_A_W02": "Center"}, labels, rule)
+
+    assert r.hold is not None and r.hold.created
+    assert conn.execute("SELECT rule_name, trigger_result_id, rule_params, inspect_round FROM hold "
+                        "WHERE hold_id = %s", (r.hold.hold_id,)).fetchone() == \
+        (rule.name, result_id(conn, "LOT_A_W02"), rule.params(), 1)
+    assert count(conn, "SELECT count(*) FROM lot_history WHERE event = 'HOLD'") == 1
+
+
+def test_i8_same_batch_resent_counts_duplicates_and_keeps_hold(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    first = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    second = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+
+    assert (second.inserted, second.duplicates) == (0, 2)
+    assert second.hold == service.HoldResult(first.hold.hold_id, created=False)
+    assert count(conn, "SELECT count(*) FROM inspection_result") == 2
+    assert count(conn, "SELECT count(*) FROM hold") == 1
+
+
+def test_i8_results_of_different_model_hash_are_recorded_separately(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, model=MODEL_A)
+    r = send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, model=MODEL_B)
+    assert r.inserted == 2
+    assert conn.execute("SELECT model_sha256, count(*) FROM inspection_result GROUP BY 1 ORDER BY 1"
+                        ).fetchall() == [(MODEL_A, 2), (MODEL_B, 2)]
+
+
+def test_i8_same_key_with_different_content_rejects_whole_batch(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs, n_wafers=3)
+    send(conn, "LOT_A", {"LOT_A_W01": "none"}, labels, rule)
+    with pytest.raises(RuleViolation) as e:
+        send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    assert e.value.rule == "I8"
+    assert conn.execute("SELECT wafer_id, pred_label FROM inspection_result").fetchall() == [("LOT_A_W01", "none")]
+    assert count(conn, "SELECT count(*) FROM hold") == 0
+
+
+def test_round_mismatch_is_rejected(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    with pytest.raises(RuleViolation) as e:
+        send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, inspect_round=2)
+    assert e.value.rule == "ROUND_MISMATCH"
+
+
+def test_results_outside_inspect_window_are_rejected(conn, route, eqs, labels, rule):
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    with pytest.raises(RuleViolation) as e_wo:  # INSPECT가 아닌 작업 지시로 보냄
+        send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, wo_id=f"LOT_A-{route[0]}")
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    track_out(conn, wo_id)
+    nxt = route[route.index(service.INSPECT_STEP) + 1]
+    track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0])
+    with pytest.raises(RuleViolation) as e_late:  # 다음 공정에 들어간 뒤
+        send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule, model=MODEL_B)
+    assert e_wo.value.rule == "RESULT_NOT_ACCEPTED" and e_late.value.rule == "RESULT_NOT_ACCEPTED"
+
+
+def test_batch_with_one_bad_wafer_is_rejected_entirely(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    make_lot(conn, "LOT_B")
+    with pytest.raises(RuleViolation) as e_other:  # 다른 Lot의 웨이퍼가 섞임
+        send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_B_W01": "none"}, labels, rule)
+    with pytest.raises(RuleViolation) as e_label:  # 약속에 없는 판정 유형
+        receive_inspection_results(conn, "LOT_A", f"LOT_A-{service.INSPECT_STEP}", 1, MODEL_A,
+                                   [ResultIn("LOT_A_W01", "Unknown", {c: 0.0 for c in labels})], labels, rule)
+    assert e_other.value.rule == "NOT_FOUND" and e_label.value.rule == "INVALID"
+    assert count(conn, "SELECT count(*) FROM inspection_result") == 0
+    assert count(conn, "SELECT count(*) FROM hold") == 0
+
+
+def test_min_count_counts_across_batches(conn, route, eqs, labels, rule):
+    rule2 = dataclasses.replace(rule, min_count=2)
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    assert send(conn, "LOT_A", {"LOT_A_W01": "Center"}, labels, rule2).hold is None
+    r = send(conn, "LOT_A", {"LOT_A_W02": "Scratch"}, labels, rule2)
+    assert r.hold is not None and r.hold.created
+    assert conn.execute("SELECT trigger_result_id, rule_params ->> 'min_count' FROM hold").fetchone() == \
+        (result_id(conn, "LOT_A_W02"), "2")
+
+
+def test_min_count_counts_distinct_wafers_not_results(conn, route, eqs, labels, rule):
+    rule2 = dataclasses.replace(rule, min_count=2)
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    assert send(conn, "LOT_A", {"LOT_A_W01": "Center"}, labels, rule2, model=MODEL_A).hold is None
+    assert send(conn, "LOT_A", {"LOT_A_W01": "Center"}, labels, rule2, model=MODEL_B).hold is None
+    r = send(conn, "LOT_A", {"LOT_A_W02": "Center"}, labels, rule2, model=MODEL_A)
+    assert r.hold is not None and r.hold.created
+    assert conn.execute("SELECT trigger_result_id FROM hold").fetchone()[0] == result_id(conn, "LOT_A_W02")
+
+
+def test_rule_hold_is_not_reopened_in_same_round_after_release(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    first = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    dispose_hold(conn, first.hold.hold_id, "RELEASE", "engineer", "엔지니어 확인 결과 정상")
+
+    again = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    other_model = send(conn, "LOT_A", {"LOT_A_W01": "Center"}, labels, rule, model=MODEL_B)
+    assert again.hold == other_model.hold == service.HoldResult(first.hold.hold_id, created=False)
+    assert count(conn, "SELECT count(*) FROM hold") == 1
+    assert count(conn, "SELECT count(*) FROM hold WHERE closed_at IS NULL") == 0
+
+
+def test_retest_opens_new_rule_hold_in_new_round(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    first = send(conn, "LOT_A", wafers("LOT_A", "Center"), labels, rule)
+    dispose_hold(conn, first.hold.hold_id, "RETEST", "engineer", "재검사 요청")
+
+    r = send(conn, "LOT_A", wafers("LOT_A", "Center"), labels, rule, inspect_round=2)
+    assert r.inserted == 2 and r.hold is not None and r.hold.created
+    assert conn.execute("SELECT inspect_round FROM hold WHERE hold_id = %s", (r.hold.hold_id,)).fetchone()[0] == 2
+
+
+def test_result_after_inspect_completed_opens_hold_and_blocks_next_step(conn, route, eqs, labels, rule):
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    track_out(conn, wo_id)
+    r = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    assert r.hold is not None and r.hold.created
+    nxt = route[route.index(service.INSPECT_STEP) + 1]
+    with pytest.raises(RuleViolation) as e:
+        track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0])
+    assert e.value.rule == "I4"
+
+
+def test_defect_result_during_equipment_down_hold_is_not_hidden(conn, route, eqs, labels, rule):
+    inspect_eq = eqs[service.INSPECT_STEP][0]
+    nxt = route[route.index(service.INSPECT_STEP) + 1]
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    down = set_equipment_status(conn, inspect_eq, "DOWN", "engineer", "검사 중 고장")
+    r = send(conn, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule)
+    assert r.hold is not None and r.hold.created and r.hold.hold_id != down.hold_id
+
+    dispose_hold(conn, down.hold_id, "RELEASE", "engineer", "설비 복구")
+    track_out(conn, wo_id)
+    with pytest.raises(RuleViolation) as e:  # 규칙 Hold가 아직 열려 있다
+        track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0])
+    assert e.value.rule == "I4"
+
+    dispose_hold(conn, r.hold.hold_id, "RELEASE", "engineer", "판정 확인 결과 정상")
+    assert not track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0]).already_processed
+
+
+# ── I13 검사 결과 없이 검사 공정 통과 ───────────────────────────
+
+def next_after_inspect(conn: psycopg.Connection, wo_id: str, route: list[str], eqs: dict[str, list[str]]):
+    track_out(conn, wo_id)
+    nxt = route[route.index(service.INSPECT_STEP) + 1]
+    return track_in(conn, "WO-NEXT", "LOT_A", nxt, eqs[nxt][0])
+
+
+@pytest.mark.parametrize("label_by_wafer", [{}, {"LOT_A_W01": "none"}], ids=["no_results", "some_wafers"])
+def test_i13_next_step_needs_results_for_all_wafers(conn, route, eqs, labels, rule, label_by_wafer):
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    if label_by_wafer:
+        send(conn, "LOT_A", label_by_wafer, labels, rule)
+    with pytest.raises(RuleViolation) as e:
+        next_after_inspect(conn, wo_id, route, eqs)
+    assert e.value.rule == "I13"
+
+
+def test_i13_all_wafers_judged_without_defect_pass(conn, route, eqs, labels, rule):
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    assert not next_after_inspect(conn, wo_id, route, eqs).already_processed
+
+
+def test_i13_after_retest_needs_results_of_new_round(conn, route, eqs, labels, rule):
+    wo_id = lot_at_inspect(conn, "LOT_A", route, eqs)
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    dispose_hold(conn, manual_hold(conn, "LOT_A"), "RETEST", "engineer", "재검사 요청")
+    with pytest.raises(RuleViolation) as e:
+        next_after_inspect(conn, wo_id, route, eqs)
+    assert e.value.rule == "I13"
+
+
+# ── 규칙 Hold의 DB 제약 ─────────────────────────────────────
+
+def test_hold_db_rejects_rule_hold_without_params(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    send(conn, "LOT_A", wafers("LOT_A", "none"), labels, rule)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, inspect_round) "
+                     "VALUES ('LOT_A', 'DEFECT_TYPE_IN_LOT', %s, 1)", (result_id(conn, "LOT_A_W01"),))
+
+
+def test_hold_db_rejects_second_rule_hold_in_same_round(conn, route, eqs, labels, rule):
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    first = send(conn, "LOT_A", wafers("LOT_A", "Center"), labels, rule)
+    dispose_hold(conn, first.hold.hold_id, "RELEASE", "engineer", "확인 완료")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        conn.execute("INSERT INTO hold (lot_id, rule_name, trigger_result_id, rule_params, inspect_round) "
+                     "VALUES ('LOT_A', %s, %s, '{}', 1)", (rule.name, result_id(conn, "LOT_A_W02")))
+
+
+# ── 판정 수신 동시성 ────────────────────────────────────────
+
+def test_concurrent_batches_for_same_lot_open_exactly_one_hold(conn, connect_test, monkeypatch,
+                                                               route, eqs, labels, rule):
+    """min_count=2, 두 배치에 정지 대상이 1장씩. Lot 잠금이 없으면 두 쪽 모두 1장만 세어 Hold를 놓친다."""
+    rule2 = dataclasses.replace(rule, min_count=2)
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
+
+    outcomes = run_at_same_time(connect_test, [
+        lambda c: send(c, "LOT_A", {"LOT_A_W01": "Center"}, labels, rule2),
+        lambda c: send(c, "LOT_A", {"LOT_A_W02": "Center"}, labels, rule2),
+    ])
+
+    no_deadlock(outcomes)
+    assert [k for k, _ in outcomes] == ["ok", "ok"], outcomes
+    assert count(conn, "SELECT count(*) FROM hold WHERE trigger_result_id IS NOT NULL") == 1
+
+
+@pytest.mark.parametrize("first", ["results", "down"])
+def test_results_and_inspect_equipment_down_in_both_orders(conn, connect_test, monkeypatch,
+                                                           route, eqs, labels, rule, first):
+    inspect_eq = eqs[service.INSPECT_STEP][0]
+    lot_at_inspect(conn, "LOT_A", route, eqs)
+    monkeypatch.setattr(service, "_lock_lot", slow_after(service._lock_lot))
+
+    outcomes = run_at_same_time(connect_test, [
+        lambda c: send(c, "LOT_A", {"LOT_A_W01": "Center", "LOT_A_W02": "none"}, labels, rule),
+        lambda c: set_equipment_status(c, inspect_eq, "DOWN", "engineer", "검사 중 고장"),
+    ], start_delays=[0.0, START_DELAY_SECONDS] if first == "results" else [START_DELAY_SECONDS, 0.0])
+
+    no_deadlock(outcomes)
+    assert [k for k, _ in outcomes] == ["ok", "ok"], outcomes
+    # 순서와 상관없이 규칙 Hold와 고장 Hold가 각각 열린다(종류별 하나).
+    assert sorted(r[0] for r in conn.execute("SELECT rule_name FROM hold WHERE closed_at IS NULL").fetchall()) \
+        == sorted([rule.name, "EQUIPMENT_DOWN"])
