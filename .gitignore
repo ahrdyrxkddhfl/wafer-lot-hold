@@ -14,3 +14,6 @@ __pycache__/
 
 # 4단계 학습 체크포인트 (해시만 기록)
 artifacts/
+
+# 처분 시연용 웨이퍼맵 그림(원본 데이터에서 만든 것이라 올리지 않음)
+reports/demo_wafers/

@@ -79,3 +79,10 @@ mes_api:
   base_url: http://localhost:8000   # uvicorn mes.api:app 주소
   timeout_seconds: 30               # 요청 하나를 기다리는 최대 시간. 짧으면 느린 요청을 실패로 본다
   progress_every_lots: 500          # 몇 Lot마다 진행 상황을 로그로 남길지
+
+# 처분 시연용 Lot 웨이퍼맵 그림(equipment/draw_wafer_maps.py). 원본 데이터에서 만든 그림이라 커밋하지 않는다.
+demo_wafers:
+  output_dir: reports/demo_wafers
+  grid_columns: 5        # 한 줄에 그릴 웨이퍼 수. 크면 그림이 가로로 넓어진다
+  cell_inches: 2.6       # 웨이퍼 한 칸의 크기(인치). 크면 칩이 더 잘 보이지만 파일이 커진다
+  dpi: 110               # 해상도. 크면 선명하지만 파일이 커진다
