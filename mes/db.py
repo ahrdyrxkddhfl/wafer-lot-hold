@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "mes.yaml"
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
+PORT_ENV = "POSTGRES_PORT"  # 있으면 config의 db.port 대신 쓴다
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -59,8 +60,17 @@ def connect(cfg: dict, dbname: str) -> psycopg.Connection:
         autocommit 연결.
     """
     db = cfg["db"]
-    return psycopg.connect(host=db["host"], port=db["port"], user=db["user"],
-                           password=get_password(), dbname=dbname, autocommit=True)
+    password = get_password()  # .env를 먼저 불러와야 POSTGRES_PORT도 .env에서 읽힌다
+    return psycopg.connect(host=db["host"], port=db_port(cfg), user=db["user"],
+                           password=password, dbname=dbname, autocommit=True)
+
+
+def db_port(cfg: dict) -> int:
+    """DB 포트. 환경변수 POSTGRES_PORT가 있으면 그 값, 없으면 config의 db.port.
+
+    같은 컴퓨터에서 이 저장소를 하나 더 띄울 때 docker compose와 같은 값을 쓰기 위해서다.
+    """
+    return int(os.environ.get(PORT_ENV) or cfg["db"]["port"])
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
