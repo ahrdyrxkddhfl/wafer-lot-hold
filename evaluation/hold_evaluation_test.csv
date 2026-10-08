@@ -1,0 +1,11 @@
+metric,value
+lots,2362
+stopped_lots,1952
+unknown_truth_lots,674
+known_truth_lots,1688
+should_stop_lots,1607
+should_not_stop_lots,81
+false_stop_lots,62
+false_stop_by_unlabeled,4
+missed_lots,18
+file_rule_lot_agreement,2362
