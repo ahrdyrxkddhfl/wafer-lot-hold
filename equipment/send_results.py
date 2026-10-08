@@ -15,6 +15,7 @@ DB에 직접 쓰지 않고, MES 설정 파일도 읽지 않는다. 공정 순서
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from collections import Counter
@@ -29,6 +30,7 @@ logger = logging.getLogger("send_results")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "equipment.yaml"
 PROB_PREFIX = "prob_"
+MES_API_URL_ENV = "MES_API_URL"  # 있으면 config의 mes_api.base_url 대신 쓴다(8000번 포트가 사용 중일 때 등)
 HTTP_OK = 200
 HTTP_CONFLICT = 409
 
@@ -126,7 +128,9 @@ def main() -> int:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     api = cfg["mes_api"]
-    mes = MesClient(api["base_url"], api["timeout_seconds"])
+    base_url = os.environ.get(MES_API_URL_ENV) or api["base_url"]
+    logger.info("MES API %s", base_url)
+    mes = MesClient(base_url, api["timeout_seconds"])
 
     layout = mes.call("GET", "/equipment").json()
     steps = sorted(layout["steps"], key=lambda s: s["seq"])
