@@ -46,3 +46,7 @@ stop_rule:
 api:
   # 판정 수신 요청 하나에 담을 수 있는 판정 수. 배치 하나는 Lot 하나의 한 차수(최대 25장)라 그보다 크게 둔다
   max_results_per_request: 50
+
+report:
+  # 생산 현황 보고(MIS) HTML 출력 위치. 저장소 기준 상대경로. 스냅샷을 커밋한다.
+  output: reports/mis.html
